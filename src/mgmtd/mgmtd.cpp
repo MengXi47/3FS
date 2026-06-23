@@ -4,5 +4,6 @@
 
 int main(int argc, char *argv[]) {
   using namespace hf3fs;
+  // mgmtd entry point, use TwoPhaseApplication to run mgmtd server
   return TwoPhaseApplication<mgmtd::MgmtdServer>().run(argc, argv);
 }

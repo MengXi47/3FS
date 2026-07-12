@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <folly/experimental/coro/Baton.h>
 #include <utility>
+#include <vector>
 
 #include "chunk_engine/src/cxx.rs.h"
 #include "common/net/ib/IBSocket.h"
@@ -97,6 +99,16 @@ class BatchReadJob {
   size_t addBufferToBatch(serde::CallContext::RDMATransmission &batch);
   size_t copyToRespBuffer(std::vector<uint8_t> &buffer);
   void finish(AioReadJob *job);
+
+  // Wave support: split jobs into fixed-size waves so RDMA writes of finished
+  // disk reads can start while the rest of the batch is still on disk.
+  void initWaves(uint32_t waveSize);
+  uint32_t numWaves() const { return waves_.size(); }
+  CoTask<void> waitWave(uint32_t index) { co_await waves_[index].baton; }
+  CoTask<void> anyWaveReady() { co_await anyWaveReady_; }
+  size_t addWaveToBatch(uint32_t index, serde::CallContext::RDMATransmission &batch);
+  void setWaveError(uint32_t index, const Status &error);
+  bool anyPostFailed() const { return anyPostFailed_.load(std::memory_order_relaxed); }
   auto checksumType() const { return checksumType_; }
   bool recalculateChecksum() const { return recalculateChecksum_; }
   void setRecalculateChecksum(bool value = true) { recalculateChecksum_ = value; }
@@ -107,12 +119,23 @@ class BatchReadJob {
 
  private:
   friend class AioReadJobIterator;
+  size_t addRangeToBatch(serde::CallContext::RDMATransmission &batch, size_t begin, size_t end);
+
+  struct WaveState {
+    std::atomic<uint32_t> remaining{};
+    folly::coro::Baton baton;
+  };
+
   std::vector<AioReadJob> jobs_;
   folly::coro::Baton baton_;
   std::atomic<uint64_t> finishedCount_{};
   std::atomic<RelativeTime> startTime_ = RelativeTime::now();
   const ChecksumType checksumType_;
   bool recalculateChecksum_ = false;
+  uint32_t waveSize_ = 0;
+  std::vector<WaveState> waves_;
+  folly::coro::Baton anyWaveReady_;
+  std::atomic<bool> anyPostFailed_{false};
 };
 
 class AioReadJobIterator {

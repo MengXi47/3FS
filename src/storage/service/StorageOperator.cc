@@ -2,6 +2,7 @@
 
 #include <boost/range/adaptor/reversed.hpp>
 #include <fmt/format.h>
+#include <folly/experimental/coro/Collect.h>
 
 #include "common/monitor/Recorder.h"
 #include "common/net/RDMAControl.h"
@@ -154,6 +155,32 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
   }
   prepareBufferRecordGuard.report(true);
 
+  // pipeline disk reads with RDMA writes unless the request bypasses RDMA transmission.
+  bool bypassRdmaXmit = BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::SEND_DATA_INLINE) ||
+                        BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::BYPASS_RDMAXMIT);
+  auto waveSize = config_.batch_read_rdma_wave_size();
+  bool pipelineRdma = waveSize > 0 && !bypassRdmaXmit;
+  net::IBSocket *pipelineIbSocket = nullptr;
+  std::map<uint8_t, hf3fs::Semaphore>::iterator pipelineSemaphoreIter;
+  if (pipelineRdma) {
+    // resolve the socket and semaphore before any job is enqueued: failing here
+    // must not destroy the batch while AIO workers still reference its jobs.
+    pipelineIbSocket = ctx.transport()->ibSocket();
+    if (UNLIKELY(pipelineIbSocket == nullptr)) {
+      XLOGF(ERR, "batch read no RDMA socket");
+      co_return makeError(StatusCode::kInvalidArg, "batch read no RDMA socket");
+    }
+    pipelineSemaphoreIter = concurrentRdmaWriteSemaphore_.find(pipelineIbSocket->device()->id());
+    if (pipelineSemaphoreIter == concurrentRdmaWriteSemaphore_.end()) {
+      XLOGF(CRITICAL,
+            "Cannot find RDMA operation semaphore for IB device #{} {}",
+            pipelineIbSocket->device()->id(),
+            pipelineIbSocket->device()->name());
+      co_return makeError(RPCCode::kIBDeviceNotFound);
+    }
+    batch.initWaves(waveSize);
+  }
+
   if (BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::BYPASS_DISKIO)) {
     for (AioReadJobIterator it(&batch); it; it++) {
       it->result().lengthInfo = it->readIO().length;
@@ -169,38 +196,81 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
   }
 
   auto waitAioAndPostRecordGuard = storageWaitAioAndPostRecorder.record();
-  auto waitAioRecordGuard = storageWaitAioRecorder.record();
-  co_await batch.complete();
-  waitAioRecordGuard.report(true);
 
-  if (BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::SEND_DATA_INLINE)) {
-    batch.copyToRespBuffer(rsp.inlinebuf.data);
-  } else if (!BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::BYPASS_RDMAXMIT)) {
-    auto ibSocket = ctx.transport()->ibSocket();
-    if (UNLIKELY(ibSocket == nullptr)) {
-      XLOGF(ERR, "batch read no RDMA socket");
-      co_return makeError(StatusCode::kInvalidArg, "batch read no RDMA socket");
+  if (!pipelineRdma) {
+    auto waitAioRecordGuard = storageWaitAioRecorder.record();
+    co_await batch.complete();
+    waitAioRecordGuard.report(true);
+
+    if (BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::SEND_DATA_INLINE)) {
+      batch.copyToRespBuffer(rsp.inlinebuf.data);
+    } else if (!BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::BYPASS_RDMAXMIT)) {
+      // barrier fallback (batch_read_rdma_wave_size = 0): transmit the whole batch at once.
+      auto ibSocket = ctx.transport()->ibSocket();
+      if (UNLIKELY(ibSocket == nullptr)) {
+        XLOGF(ERR, "batch read no RDMA socket");
+        co_return makeError(StatusCode::kInvalidArg, "batch read no RDMA socket");
+      }
+
+      auto waitBatchRecordGuard = storageWaitBatchRecorder.record();
+      auto writeBatch = ctx.writeTransmission();
+      batch.addBufferToBatch(writeBatch);
+      waitBatchRecordGuard.report(true);
+
+      auto rdmaSemaphoreIter = concurrentRdmaWriteSemaphore_.find(ibSocket->device()->id());
+      if (rdmaSemaphoreIter == concurrentRdmaWriteSemaphore_.end()) {
+        XLOGF(CRITICAL,
+              "Cannot find RDMA operation semaphore for IB device #{} {}",
+              ibSocket->device()->id(),
+              ibSocket->device()->name());
+        co_return makeError(RPCCode::kIBDeviceNotFound);
+      }
+
+      auto RDMATransmissionReqTimeout = config_.rdma_transmission_req_timeout();
+      bool applyTransmissionBeforeGettingSemaphore = config_.apply_transmission_before_getting_semaphore();
+      if (ctx.packet().controlRDMA() && RDMATransmissionReqTimeout != 0_ms && applyTransmissionBeforeGettingSemaphore) {
+        co_await writeBatch.applyTransmission(RDMATransmissionReqTimeout);
+      }
+
+      auto ibdevTagSet = monitor::instanceTagSet(ibSocket->device()->name());
+      auto waitSemRecordGuard = storageWaitSemRecorder.record(ibdevTagSet);
+      SemaphoreGuard guard(rdmaSemaphoreIter->second);
+      co_await guard.coWait();
+      waitSemRecordGuard.report(true);
+
+      if (ctx.packet().controlRDMA() && RDMATransmissionReqTimeout != 0_ms &&
+          !applyTransmissionBeforeGettingSemaphore) {
+        co_await writeBatch.applyTransmission(RDMATransmissionReqTimeout);
+      }
+
+      auto waitPostRecordGuard = storageWaitPostRecorder.record(ibdevTagSet);
+      auto postResult = FAULT_INJECTION_POINT(requestCtx.debugFlags.injectServerError(),
+                                              makeError(RPCCode::kRDMAPostFailed),
+                                              (co_await writeBatch.post()));
+      if (UNLIKELY(!postResult)) {
+        for (AioReadJobIterator it(&batch); it; it++) {
+          it->result().lengthInfo = makeError(std::move(postResult.error()));
+        }
+      } else {
+        waitPostRecordGuard.succ();
+      }
     }
-
-    auto waitBatchRecordGuard = storageWaitBatchRecorder.record();
-    auto writeBatch = ctx.writeTransmission();
-    batch.addBufferToBatch(writeBatch);
-    waitBatchRecordGuard.report(true);
-
-    auto rdmaSemaphoreIter = concurrentRdmaWriteSemaphore_.find(ibSocket->device()->id());
-    if (rdmaSemaphoreIter == concurrentRdmaWriteSemaphore_.end()) {
-      XLOGF(CRITICAL,
-            "Cannot find RDMA operation semaphore for IB device #{} {}",
-            ibSocket->device()->id(),
-            ibSocket->device()->name());
-      co_return makeError(RPCCode::kIBDeviceNotFound);
-    }
+  } else {
+    auto ibSocket = pipelineIbSocket;
+    auto rdmaSemaphoreIter = pipelineSemaphoreIter;
 
     auto RDMATransmissionReqTimeout = config_.rdma_transmission_req_timeout();
     bool applyTransmissionBeforeGettingSemaphore = config_.apply_transmission_before_getting_semaphore();
     if (ctx.packet().controlRDMA() && RDMATransmissionReqTimeout != 0_ms && applyTransmissionBeforeGettingSemaphore) {
-      co_await writeBatch.applyTransmission(RDMATransmissionReqTimeout);
+      auto controlBatch = ctx.writeTransmission();
+      co_await controlBatch.applyTransmission(RDMATransmissionReqTimeout);
     }
+
+    // wait until the first wave of disk reads is ready before taking the
+    // semaphore, so the token is not held during pure disk latency.
+    auto waitAioRecordGuard = storageWaitAioRecorder.record();
+    co_await batch.anyWaveReady();
+    waitAioRecordGuard.report(true);
 
     auto ibdevTagSet = monitor::instanceTagSet(ibSocket->device()->name());
     auto waitSemRecordGuard = storageWaitSemRecorder.record(ibdevTagSet);
@@ -209,18 +279,20 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
     waitSemRecordGuard.report(true);
 
     if (ctx.packet().controlRDMA() && RDMATransmissionReqTimeout != 0_ms && !applyTransmissionBeforeGettingSemaphore) {
-      co_await writeBatch.applyTransmission(RDMATransmissionReqTimeout);
+      auto controlBatch = ctx.writeTransmission();
+      co_await controlBatch.applyTransmission(RDMATransmissionReqTimeout);
     }
 
+    // post each wave as soon as its disk reads finish; waves transfer in
+    // parallel so disk IO overlaps with network transmission.
     auto waitPostRecordGuard = storageWaitPostRecorder.record(ibdevTagSet);
-    auto postResult = FAULT_INJECTION_POINT(requestCtx.debugFlags.injectServerError(),
-                                            makeError(RPCCode::kRDMAPostFailed),
-                                            (co_await writeBatch.post()));
-    if (UNLIKELY(!postResult)) {
-      for (AioReadJobIterator it(&batch); it; it++) {
-        it->result().lengthInfo = makeError(std::move(postResult.error()));
-      }
-    } else {
+    std::vector<CoTask<void>> waveTasks;
+    waveTasks.reserve(batch.numWaves());
+    for (uint32_t waveIndex = 0; waveIndex < batch.numWaves(); ++waveIndex) {
+      waveTasks.push_back(postReadWave(requestCtx, batch, ctx, waveIndex));
+    }
+    co_await folly::coro::collectAllRange(std::move(waveTasks));
+    if (LIKELY(!batch.anyPostFailed())) {
       waitPostRecordGuard.succ();
     }
   }
@@ -228,6 +300,21 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
 
   recordGuard.succ();
   co_return rsp;
+}
+
+CoTask<void> StorageOperator::postReadWave(ServiceRequestContext &requestCtx,
+                                           BatchReadJob &batch,
+                                           serde::CallContext &ctx,
+                                           uint32_t waveIndex) {
+  co_await batch.waitWave(waveIndex);
+  auto waveBatch = ctx.writeTransmission();
+  batch.addWaveToBatch(waveIndex, waveBatch);
+  auto postResult = FAULT_INJECTION_POINT(requestCtx.debugFlags.injectServerError(),
+                                          makeError(RPCCode::kRDMAPostFailed),
+                                          (co_await waveBatch.post()));
+  if (UNLIKELY(!postResult)) {
+    batch.setWaveError(waveIndex, postResult.error());
+  }
 }
 
 CoTryTask<WriteRsp> StorageOperator::write(ServiceRequestContext &requestCtx,

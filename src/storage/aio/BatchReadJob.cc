@@ -72,9 +72,14 @@ BatchReadJob::BatchReadJob(std::span<const ReadIO> readIOs, std::span<IOResult> 
 }
 
 size_t BatchReadJob::addBufferToBatch(serde::CallContext::RDMATransmission &batch) {
+  return addRangeToBatch(batch, 0, jobs_.size());
+}
+
+size_t BatchReadJob::addRangeToBatch(serde::CallContext::RDMATransmission &batch, size_t begin, size_t end) {
   size_t writeCount = 0;
   size_t writeBytes = 0;
-  for (auto &job : jobs_) {
+  for (auto i = begin; i < end; ++i) {
+    auto &job = jobs_[i];
     if (job.result().lengthInfo) {
       auto length = *job.result().lengthInfo;
       auto localbuf = job.state().localbuf.subrange(job.state().headLength, length);
@@ -91,6 +96,36 @@ size_t BatchReadJob::addBufferToBatch(serde::CallContext::RDMATransmission &batc
   rdmaWriteCount.addSample(writeCount);
   rdmaWriteBytes.addSample(writeBytes);
   return writeBytes;
+}
+
+void BatchReadJob::initWaves(uint32_t waveSize) {
+  waveSize_ = std::min<size_t>(waveSize, jobs_.size());
+  if (waveSize_ == 0) {
+    return;
+  }
+  auto numWaves = (jobs_.size() + waveSize_ - 1) / waveSize_;
+  waves_ = std::vector<WaveState>(numWaves);
+  for (auto i = 0ul; i < numWaves; ++i) {
+    waves_[i].remaining.store(std::min<size_t>(waveSize_, jobs_.size() - i * waveSize_), std::memory_order_relaxed);
+  }
+}
+
+size_t BatchReadJob::addWaveToBatch(uint32_t index, serde::CallContext::RDMATransmission &batch) {
+  auto begin = size_t(index) * waveSize_;
+  auto end = std::min(begin + waveSize_, jobs_.size());
+  return addRangeToBatch(batch, begin, end);
+}
+
+void BatchReadJob::setWaveError(uint32_t index, const Status &error) {
+  auto begin = size_t(index) * waveSize_;
+  auto end = std::min(begin + waveSize_, jobs_.size());
+  for (auto i = begin; i < end; ++i) {
+    auto &job = jobs_[i];
+    if (job.result().lengthInfo) {
+      job.result().lengthInfo = makeError(error);
+    }
+  }
+  anyPostFailed_.store(true, std::memory_order_relaxed);
 }
 
 size_t BatchReadJob::copyToRespBuffer(std::vector<uint8_t> &buffer) {
@@ -113,7 +148,13 @@ size_t BatchReadJob::copyToRespBuffer(std::vector<uint8_t> &buffer) {
 }
 
 void BatchReadJob::finish(AioReadJob *job) {
-  (void)job;
+  if (!waves_.empty()) {
+    auto waveIndex = static_cast<size_t>(job - jobs_.data()) / waveSize_;
+    if (waves_[waveIndex].remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      waves_[waveIndex].baton.post();
+      anyWaveReady_.post();  // idempotent, first ready wave wins
+    }
+  }
   if (++finishedCount_ == jobs_.size()) {
     batchReadLatency.addSample(RelativeTime::now() - startTime());
     baton_.post();

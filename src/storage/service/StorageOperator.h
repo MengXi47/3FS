@@ -34,6 +34,10 @@ class StorageOperator {
     CONFIG_OBJ(event_trace_log, analytics::StructuredTraceLog<StorageEventTrace>::Config);
     CONFIG_HOT_UPDATED_ITEM(max_num_results_per_query, uint32_t{100});
     CONFIG_HOT_UPDATED_ITEM(batch_read_job_split_size, uint32_t{1024});
+    // pipeline disk reads with RDMA writes: post finished waves of this many IOs
+    // while the rest of the batch is still reading from disk. 0 = wait for the
+    // whole batch before transmitting (old barrier behavior).
+    CONFIG_HOT_UPDATED_ITEM(batch_read_rdma_wave_size, uint32_t{32});
     CONFIG_HOT_UPDATED_ITEM(post_buffer_per_bytes, 64_KB);
     CONFIG_HOT_UPDATED_ITEM(batch_read_ignore_chain_version, false);
     CONFIG_HOT_UPDATED_ITEM(max_concurrent_rdma_writes, 256U);
@@ -99,6 +103,11 @@ class StorageOperator {
 
  protected:
   using ChunkMetadataProcessor = std::function<CoTryTask<void>(const ChunkId &, const ChunkMetadata &)>;
+
+  CoTask<void> postReadWave(ServiceRequestContext &requestCtx,
+                            BatchReadJob &batch,
+                            serde::CallContext &ctx,
+                            uint32_t waveIndex);
 
   CoTask<IOResult> handleUpdate(ServiceRequestContext &requestCtx,
                                 UpdateReq &req,

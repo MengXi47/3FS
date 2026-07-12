@@ -33,7 +33,9 @@ class StorageOperator {
     CONFIG_OBJ(write_worker, UpdateWorker::Config);
     CONFIG_OBJ(event_trace_log, analytics::StructuredTraceLog<StorageEventTrace>::Config);
     CONFIG_HOT_UPDATED_ITEM(max_num_results_per_query, uint32_t{100});
-    CONFIG_HOT_UPDATED_ITEM(batch_read_job_split_size, uint32_t{1024});
+    // split large batches across multiple AIO worker threads so metadata
+    // lookup, submission and reaping run in parallel per segment.
+    CONFIG_HOT_UPDATED_ITEM(batch_read_job_split_size, uint32_t{128});
     // pipeline disk reads with RDMA writes: post finished waves of this many IOs
     // while the rest of the batch is still reading from disk. 0 = wait for the
     // whole batch before transmitting (old barrier behavior).

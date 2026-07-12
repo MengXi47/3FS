@@ -28,7 +28,10 @@ class AioReadWorker {
     CONFIG_ITEM(queue_size, 4096u);
     CONFIG_ITEM(max_events, 512u);
     CONFIG_ITEM(enable_io_uring, true);
-    CONFIG_HOT_UPDATED_ITEM(min_complete, 128u);
+    // reap granularity: keep it aligned with StorageOperator's
+    // batch_read_rdma_wave_size so finished waves are handed to the RDMA
+    // pipeline promptly instead of waiting for a large completion batch.
+    CONFIG_HOT_UPDATED_ITEM(min_complete, 32u);
     CONFIG_HOT_UPDATED_ITEM(wait_all_inflight, false);      // deprecated.
     CONFIG_HOT_UPDATED_ITEM(inflight_control_offset, 128);  // deprecated.
     // io_uring uses the pre-registered buffers (skips per-IO page pinning) and

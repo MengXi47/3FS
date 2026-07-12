@@ -92,6 +92,12 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
   auto snapshot = components_.targetMap.snapshot();
   auto batchSize = req.payloads.size();
   BatchReadRsp rsp;
+  if (UNLIKELY(batchSize == 0)) {
+    // defense in depth: StorageService already rejects empty batches, but an
+    // empty batch would hang forever on anyWaveReady()/complete() below since
+    // no job ever calls finish().
+    co_return rsp;
+  }
   rsp.results.resize(batchSize);
   BatchReadJob batch(req.payloads, rsp.results, req.checksumType);
   storageReadCount.addSample(batchSize);
@@ -258,14 +264,23 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
                                               makeError(RPCCode::kRDMAPostFailed),
                                               (co_await writeBatch.post()));
       if (UNLIKELY(!postResult)) {
+        // keep the original disk error for jobs that never entered the RDMA
+        // batch; matches the wave-pipeline path semantics.
         for (AioReadJobIterator it(&batch); it; it++) {
-          it->result().lengthInfo = makeError(std::move(postResult.error()));
+          if (it->result().lengthInfo) {
+            it->result().lengthInfo = makeError(postResult.error());
+          }
         }
       } else {
         waitPostRecordGuard.succ();
       }
     }
   } else {
+    // NOTE: AIO jobs are already enqueued and reference this coroutine frame;
+    // everything from here to the end of the wave posts relies on the
+    // Result<>-based error handling below never throwing. An escaping C++
+    // exception would unwind past `batch` while AIO workers still hold job
+    // pointers (the RPC layer treats handler exceptions as FATAL anyway).
     auto ibSocket = pipelineIbSocket;
     auto rdmaSemaphoreIter = pipelineSemaphoreIter;
 

@@ -1121,6 +1121,9 @@ int IBSocket::rdmaPostWR(RDMAPostCtx &ctx) {
 
   ctx.postBegin = std::chrono::steady_clock::now();
 
+  // concurrent posts to the same QP are relied upon here (parallel rdmaPost
+  // coroutines may resume on different threads): libibverbs guarantees all
+  // verbs calls are thread-safe (providers serialize WQE submission per QP).
   ibv_send_wr *bad = nullptr;
   const int ret = ibv_post_send(qp_.get(), &wrs[0], &bad);
   if (LIKELY(ret == 0)) {

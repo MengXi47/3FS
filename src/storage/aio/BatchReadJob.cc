@@ -155,6 +155,7 @@ size_t BatchReadJob::copyToRespBuffer(std::vector<uint8_t> &buffer) {
 void BatchReadJob::finish(AioReadJob *job) {
   if (!waves_.empty()) {
     auto waveIndex = static_cast<size_t>(job - jobs_.data()) / waveSize_;
+    assert(waveIndex < waves_.size());
     if (waves_[waveIndex].remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
       waves_[waveIndex].baton.post();
       anyWaveReady_.post();  // idempotent, first ready wave wins

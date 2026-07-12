@@ -183,7 +183,24 @@ Result<Void> IoUringStatus::init(uint32_t maxEvents,
                                  const std::vector<struct iovec> &iovecs) {
   maxEvents_ = maxEvents;
 
-  auto ret = ::io_uring_queue_init(maxEvents_, &ring_, 0);
+  // each worker thread owns its ring exclusively (init/submit/reap all run on
+  // the same thread), so SINGLE_ISSUER applies; COOP_TASKRUN avoids IPI-based
+  // completion interrupts. older kernels reject unknown flags with EINVAL, so
+  // fall back step by step.
+  static constexpr unsigned kSetupFlags[] = {
+      IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN,
+      IORING_SETUP_COOP_TASKRUN,
+      0,
+  };
+  int ret = -EINVAL;
+  for (auto flags : kSetupFlags) {
+    struct io_uring_params params {};
+    params.flags = flags;
+    ret = ::io_uring_queue_init_params(maxEvents_, &ring_, &params);
+    if (ret != -EINVAL) {
+      break;
+    }
+  }
   if (UNLIKELY(ret != 0)) {
     auto msg = fmt::format("init io uring failed: {}, maxEvents {}", ret, maxEvents);
     XLOG(ERR, msg);

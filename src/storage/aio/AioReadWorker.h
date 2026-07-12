@@ -31,7 +31,9 @@ class AioReadWorker {
     CONFIG_HOT_UPDATED_ITEM(min_complete, 128u);
     CONFIG_HOT_UPDATED_ITEM(wait_all_inflight, false);      // deprecated.
     CONFIG_HOT_UPDATED_ITEM(inflight_control_offset, 128);  // deprecated.
-    CONFIG_HOT_UPDATED_ITEM(ioengine, IoEngine::libaio);
+    // io_uring uses the pre-registered buffers (skips per-IO page pinning) and
+    // registered fds; set to libaio to fall back to the legacy engine.
+    CONFIG_HOT_UPDATED_ITEM(ioengine, IoEngine::io_uring);
 
    public:
     inline bool useIoUring() const {

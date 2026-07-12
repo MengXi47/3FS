@@ -99,24 +99,33 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
   size_t totalLength = 0;
   size_t totalHeadLength = 0;
   size_t totalTailLength = 0;
+  // sequential reads usually target the same chain: cache the last lookup to
+  // avoid two hash-map probes and the state checks for every IO in the batch.
+  const Target *cachedTarget = nullptr;
+  VersionedChainId cachedVChainId{};
   for (AioReadJobIterator it(&batch); it; it++) {
-    // get target for batch read, need check public and local state.
-    auto targetResult = FAULT_INJECTION_POINT(
-        requestCtx.debugFlags.injectServerError(),
-        makeError(StorageCode::kChainVersionMismatch),
-        snapshot->getByChainId(it->readIO().key.vChainId, config_.batch_read_ignore_chain_version()));
-    if (UNLIKELY(!targetResult)) {
-      auto msg = fmt::format("read get target failed, req {}, error {}", it->readIO(), targetResult.error());
-      XLOG(ERR, msg);
-      co_return makeError(std::move(targetResult.error()));
+    auto vChainId = it->readIO().key.vChainId;
+    if (cachedTarget == nullptr || vChainId != cachedVChainId) {
+      // get target for batch read, need check public and local state.
+      auto targetResult =
+          FAULT_INJECTION_POINT(requestCtx.debugFlags.injectServerError(),
+                                makeError(StorageCode::kChainVersionMismatch),
+                                snapshot->getByChainId(vChainId, config_.batch_read_ignore_chain_version()));
+      if (UNLIKELY(!targetResult)) {
+        auto msg = fmt::format("read get target failed, req {}, error {}", it->readIO(), targetResult.error());
+        XLOG(ERR, msg);
+        co_return makeError(std::move(targetResult.error()));
+      }
+      auto target = std::move(*targetResult);
+      if (UNLIKELY(!target->upToDate())) {
+        auto msg = fmt::format("read target is not upToDate, req {}, target {}", it->readIO(), *target);
+        XLOG(ERR, msg);
+        co_return makeError(StorageCode::kTargetStateInvalid, std::move(msg));
+      }
+      cachedTarget = target;
+      cachedVChainId = vChainId;
     }
-    auto target = std::move(*targetResult);
-    if (UNLIKELY(!target->upToDate())) {
-      auto msg = fmt::format("read target is not upToDate, req {}, target {}", it->readIO(), *target);
-      XLOG(ERR, msg);
-      co_return makeError(StorageCode::kTargetStateInvalid, std::move(msg));
-    }
-    it->state().storageTarget = target->storageTarget.get();
+    it->state().storageTarget = cachedTarget->storageTarget.get();
     totalLength += it->readIO().length;
     totalHeadLength += it->state().headLength;
     totalTailLength += it->state().tailLength;

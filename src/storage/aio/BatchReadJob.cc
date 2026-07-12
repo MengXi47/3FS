@@ -129,18 +129,22 @@ void BatchReadJob::setWaveError(uint32_t index, const Status &error) {
 }
 
 size_t BatchReadJob::copyToRespBuffer(std::vector<uint8_t> &buffer) {
+  // reserve the exact total once: the old per-job resize with a first-job-based
+  // estimate caused repeated reallocations (and copies) for variable-sized jobs.
+  size_t totalBytes = 0;
+  for (auto &job : jobs_) {
+    if (job.result().lengthInfo) {
+      totalBytes += *job.result().lengthInfo;
+    }
+  }
+  buffer.reserve(buffer.size() + totalBytes);
+
   size_t sendBytes = 0;
   for (auto &job : jobs_) {
     if (job.result().lengthInfo) {
-      // check chunk version.
       auto length = *job.result().lengthInfo;
       auto localbuf = job.state().localbuf.subrange(job.state().headLength, length);
-      size_t bufEnd = buffer.size();
-
-      if (buffer.empty()) buffer.reserve(localbuf.size() * jobs_.size());
-      buffer.resize(buffer.size() + localbuf.size());
-      std::memcpy(&buffer[bufEnd], localbuf.ptr(), localbuf.size());
-
+      buffer.insert(buffer.end(), localbuf.ptr(), localbuf.ptr() + localbuf.size());
       sendBytes += length;
     }
   }

@@ -76,18 +76,40 @@ Result<Void> AioReadWorker::run(AioStatus &aioStatus, IoUringStatus &ioUringStat
     IoStatus &status = config_.useIoUring() ? static_cast<IoStatus &>(ioUringStatus) : aioStatus;
     status.setAioReadJobIterator(it);
 
+    // Keep the submission window full: refill right after each reap instead of
+    // draining all inflight IOs to zero before collecting new jobs.
+    bool stopping = false;
     do {
       // 2. collect a batch of read jobs.
       status.collect();
 
-      // 3. submit a batch of read jobs.
+      // 3. the current iterator is exhausted but the window still has room:
+      //    opportunistically pull more batches from the queue to keep the disk busy.
+      while (!stopping && !status.hasUnfinishedBatchReadJob() && status.availableToSubmit()) {
+        auto next = queue_.try_dequeue();
+        if (!next.has_value()) {
+          break;
+        }
+        if (next->isNull()) {
+          // hand the stop signal back to sibling threads; finish inflight IOs first.
+          stopping = true;
+          queue_.enqueue(AioReadJobIterator{});
+          break;
+        }
+        batchReadInQueueRecorder.addSample(RelativeTime::now() - next->startTime());
+        (*next)->batch().resetStartTime();
+        status.setAioReadJobIterator(*next);
+        status.collect();
+      }
+
+      // 4. submit a batch of read jobs.
       status.submit();
 
-      // 4. wait a batch of events.
-      while (status.inflight()) {
+      // 5. wait a batch of events, then go back to refill the window.
+      if (status.inflight()) {
         status.reap(config_.min_complete());
-      };
-    } while (status.hasUnfinishedBatchReadJob());
+      }
+    } while (status.hasUnfinishedBatchReadJob() || status.inflight());
   }
 
   return Void{};

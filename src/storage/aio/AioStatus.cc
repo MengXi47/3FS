@@ -246,7 +246,9 @@ void IoUringStatus::submit() {
   auto recordGuard = ioSubmitRecorder.record();
   int ret = ::io_uring_submit(&ring_);
   if (LIKELY(ret >= 0)) {
-    assert(ret == (int)inflight_);
+    // with pipelined refill there may be older inflight IOs, so compare against
+    // the number of SQEs prepared in this round instead of the total inflight.
+    assert(ret == (int)submittingJobs_.size());
     recordGuard.succ();
     ioSubmitSize.addSample(ret);
   } else {

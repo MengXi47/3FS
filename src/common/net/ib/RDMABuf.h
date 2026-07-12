@@ -191,6 +191,17 @@ class RDMABuf {
     return RDMABuf(buf_, begin_ + offset, length);
   }
 
+  // extend this buffer by absorbing `next` when it is the immediately
+  // following subrange of the same registered buffer (same MR, so the
+  // merged range is still fully covered by one lkey).
+  bool tryExtend(const RDMABuf &next) {
+    if (!buf_ || buf_ != next.buf_ || begin_ + length_ != next.begin_) {
+      return false;
+    }
+    length_ += next.length_;
+    return true;
+  }
+
   RDMABuf first(size_t length) const { return subrange(0, length); }
   RDMABuf takeFirst(size_t length) {
     auto buf = first(length);

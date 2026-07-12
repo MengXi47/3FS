@@ -258,19 +258,43 @@ bool IBSocket::RecvBuffers::pop() {
 Result<Void> IBSocket::RDMAReqBatch::add(const RDMARemoteBuf &remoteBuf, RDMABuf localBuf) {
   auto raddr = remoteBuf.addr();
   auto rkey = remoteBuf.getRkey(socket_->peerInfo_.dev);
+  auto maxMsgSize = socket_->port_.attr().max_msg_sz;
   if (UNLIKELY(!localBuf || !rkey.has_value() || localBuf.size() > remoteBuf.size() ||
-               localBuf.size() > socket_->port_.attr().max_msg_sz)) {
+               localBuf.size() > maxMsgSize)) {
     XLOGF(ERR,
           "RDMAReqBatch::add invalid args, {} {} {} {} {}",
           localBuf.valid(),
           rkey.has_value(),
           localBuf.size(),
           remoteBuf.size(),
-          socket_->port_.attr().max_msg_sz);
+          maxMsgSize);
     return makeError(StatusCode::kInvalidArg);
   }
+
+  // coalesce with the previous request when the remote range is contiguous:
+  // fewer WRs means fewer send queue slots, doorbells and CQEs per batch.
+  auto localBufSize = localBuf.size();
+  if (!reqs_.empty()) {
+    auto &prev = reqs_.back();
+    if (prev.rkey == rkey.value() && prev.raddr + prev.totalBytes == raddr &&
+        size_t(prev.totalBytes) + localBufSize <= maxMsgSize) {
+      if (localBufs_.back().tryExtend(localBuf)) {
+        // local range is contiguous too: widen the last SGE in place.
+        prev.totalBytes += localBufSize;
+        return Void{};
+      }
+      if (prev.localBufCnt < socket_->connectConfig_.max_sge) {
+        // append one more SGE to the previous WR.
+        localBufs_.emplace_back(std::move(localBuf));
+        prev.localBufCnt += 1;
+        prev.totalBytes += localBufSize;
+        return Void{};
+      }
+    }
+  }
+
   localBufs_.emplace_back(std::move(localBuf));
-  reqs_.emplace_back(raddr, rkey.value(), localBufs_.size() - 1, 1);
+  reqs_.emplace_back(raddr, rkey.value(), localBufs_.size() - 1, 1, localBufSize);
   return Void{};
 }
 
@@ -298,7 +322,7 @@ Result<Void> IBSocket::RDMAReqBatch::add(RDMARemoteBuf remoteBuf, std::span<RDMA
       return makeError(StatusCode::kInvalidArg);
     }
     localBufs_.insert(localBufs_.end(), lbufs.begin(), lbufs.end());
-    reqs_.emplace_back(raddr, rkey.value(), localBufs_.size() - lbufs.size(), lbufs.size());
+    reqs_.emplace_back(raddr, rkey.value(), localBufs_.size() - lbufs.size(), lbufs.size(), total);
   }
 
   return Void{};

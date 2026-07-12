@@ -172,14 +172,16 @@ class IBSocket : public Socket, folly::MoveOnly {
     uint32_t rkey;
     uint32_t localBufFirst;
     uint32_t localBufCnt;
+    uint32_t totalBytes;  // sum of local buffer sizes, for contiguity checks and max_msg_sz limits
 
     RDMAReq()
-        : RDMAReq(0, 0, 0, 0) {}
-    RDMAReq(uint64_t raddr, uint32_t rkey, uint32_t localBufFirst, uint32_t localBufCnt)
+        : RDMAReq(0, 0, 0, 0, 0) {}
+    RDMAReq(uint64_t raddr, uint32_t rkey, uint32_t localBufFirst, uint32_t localBufCnt, uint32_t totalBytes)
         : raddr(raddr),
           rkey(rkey),
           localBufFirst(localBufFirst),
-          localBufCnt(localBufCnt) {}
+          localBufCnt(localBufCnt),
+          totalBytes(totalBytes) {}
   };
 
  public:

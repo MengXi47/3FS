@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstring>
+#include <folly/small_vector.h>
 #include <limits>
 
 #include "chunk_engine/src/cxx.rs.h"
@@ -38,13 +40,14 @@ struct ChunkEngine {
       const auto &chunkId = job.readIO().key.chunkId;
       auto chainId = job.readIO().key.vChainId.chainId;
 
-      std::string key;
-      key.reserve(sizeof(chainId) + chunkId.data().size());
-      key.append((const char *)&chainId, sizeof(chainId));
-      key.append(chunkId.data());
+      // hot path: chainId(4B) + typical chunk id(16B) exceeds std::string SSO,
+      // build the lookup key on the stack to avoid one heap allocation per IO.
+      folly::small_vector<uint8_t, 32> key(sizeof(chainId) + chunkId.data().size());
+      std::memcpy(key.data(), &chainId, sizeof(chainId));
+      std::memcpy(key.data() + sizeof(chainId), chunkId.data().data(), chunkId.data().size());
 
       std::string error;
-      auto chunk = engine.get_raw_chunk(toSlice(key), error);
+      auto chunk = engine.get_raw_chunk(rust::Slice<const uint8_t>{key.data(), key.size()}, error);
       if (UNLIKELY(!error.empty())) {
         return makeError(StorageCode::kChunkMetadataGetError, std::move(error));
       }

@@ -76,6 +76,7 @@ size_t BatchReadJob::addBufferToBatch(serde::CallContext::RDMATransmission &batc
 }
 
 size_t BatchReadJob::addRangeToBatch(serde::CallContext::RDMATransmission &batch, size_t begin, size_t end) {
+  batch.reserve(end - begin, end - begin);  // upper bound: coalescing may use fewer entries
   size_t writeCount = 0;
   size_t writeBytes = 0;
   for (auto i = begin; i < end; ++i) {

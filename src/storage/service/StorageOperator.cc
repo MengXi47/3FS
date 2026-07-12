@@ -3,6 +3,7 @@
 #include <boost/range/adaptor/reversed.hpp>
 #include <fmt/format.h>
 #include <folly/experimental/coro/Collect.h>
+#include <folly/small_vector.h>
 
 #include "common/monitor/Recorder.h"
 #include "common/net/RDMAControl.h"
@@ -295,7 +296,7 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
     // post each wave as soon as its disk reads finish; waves transfer in
     // parallel so disk IO overlaps with network transmission.
     auto waitPostRecordGuard = storageWaitPostRecorder.record(ibdevTagSet);
-    std::vector<CoTask<void>> waveTasks;
+    folly::small_vector<CoTask<void>, 8> waveTasks;  // ≤256-IO batches stay allocation-free
     waveTasks.reserve(batch.numWaves());
     for (uint32_t waveIndex = 0; waveIndex < batch.numWaves(); ++waveIndex) {
       waveTasks.push_back(postReadWave(requestCtx, batch, ctx, waveIndex));

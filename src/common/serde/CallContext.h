@@ -101,6 +101,8 @@ class CallContext {
       return batch_.add(remoteBuf, localBuf);
     }
 
+    void reserve(size_t numReqs, size_t numLocalBufs) { batch_.reserve(numReqs, numLocalBufs); }
+
     CoTask<void> applyTransmission(Duration timeout);
 
     CoTryTask<void> post() { return batch_.post(); }

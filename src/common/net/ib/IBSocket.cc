@@ -971,10 +971,21 @@ CoTryTask<void> IBSocket::rdmaBatch(ibv_wr_opcode opcode,
   auto begin = std::chrono::steady_clock::now();
   size_t wrsPerPost = connectConfig_.max_rdma_wr_per_post;
   size_t numPosts = (reqs.size() + wrsPerPost - 1) / wrsPerPost;
-  std::vector<RDMAPostCtx> posts(numPosts);
 
   if (UNLIKELY(numPosts == 0)) {
     co_return Void{};
+  }
+
+  // single-post fast path: with WR coalescing most batches fit into one post,
+  // keep the context in the coroutine frame instead of a heap-allocated vector.
+  RDMAPostCtx singlePost;
+  std::vector<RDMAPostCtx> multiPosts;
+  std::span<RDMAPostCtx> posts;
+  if (LIKELY(numPosts == 1)) {
+    posts = {&singlePost, 1};
+  } else {
+    multiPosts = std::vector<RDMAPostCtx>(numPosts);
+    posts = multiPosts;
   }
 
   /* setup post info and wait on semaphore */

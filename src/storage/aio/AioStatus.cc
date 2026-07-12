@@ -208,6 +208,11 @@ Result<Void> IoUringStatus::init(uint32_t maxEvents,
   }
   submittingJobs_.reserve(maxEvents_);
 
+  // skip the fdget/fdput pair on every io_uring_enter (submit/reap); purely a
+  // performance hint, older kernels without the feature keep the normal path.
+  ret = ::io_uring_register_ring_fd(&ring_);
+  XLOGF_IF(INFO, ret < 0, "io_uring_register_ring_fd unsupported: {}, fallback to normal fd path", ret);
+
   if (!fds.empty()) {
     int ret = ::io_uring_register_files(&ring_, fds.data(), fds.size());
     if (UNLIKELY(ret != 0)) {

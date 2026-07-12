@@ -512,7 +512,6 @@ std::vector<Op *> selectRoutingTargetForOps(ClientRequestContext &requestCtx,
            routingInfo->raw()->targets.size());
 
   std::unordered_map<ChainId, SlimChainInfo> slimChains(ops.size());
-  std::unordered_map<ChainId, hf3fs::flat::ChainInfo> chainInfos(ops.size());
   auto targetSelectionStrategy = TargetSelectionStrategy::create(options);
   auto selectNodeInTrafficZone = flat::selectNodeByTrafficZone(options.trafficZone());
 
@@ -522,20 +521,23 @@ std::vector<Op *> selectRoutingTargetForOps(ClientRequestContext &requestCtx,
   for (auto op : ops) {
     auto chainId = op->routingTarget.chainId;
 
-    if (slimChains.count(chainId) == 0) {
+    // single probe instead of count() + two operator[]; the entry is erased
+    // again below if populating the chain info fails.
+    auto [slimIt, inserted] = slimChains.try_emplace(chainId);
+    if (inserted) {
       auto chainInfo = getChainInfo(routingInfo, hf3fs::flat::ChainId(chainId));
 
       if (!chainInfo) {
         setErrorCodeOfOp(op, chainInfo.error().code());
+        slimChains.erase(slimIt);
         continue;
       }
-
-      chainInfos.emplace(chainId, *chainInfo);
 
       auto servingTargets = selectServingTargets(routingInfo, *chainInfo, selectNodeInTrafficZone);
 
       if (!servingTargets) {
         setErrorCodeOfOp(op, servingTargets.error().code());
+        slimChains.erase(slimIt);
         continue;
       }
 
@@ -577,7 +579,7 @@ std::vector<Op *> selectRoutingTargetForOps(ClientRequestContext &requestCtx,
         }
       }
 
-      SlimChainInfo &slimChain = slimChains[chainId];
+      SlimChainInfo &slimChain = slimIt->second;
       slimChain.chainId = chainId;
       slimChain.version = chainInfo->chainVersion;
       slimChain.routingInfoVer = routingInfo->raw()->routingInfoVersion;
@@ -589,7 +591,7 @@ std::vector<Op *> selectRoutingTargetForOps(ClientRequestContext &requestCtx,
       }
     }
 
-    const SlimChainInfo &slimChain = slimChains[chainId];
+    const SlimChainInfo &slimChain = slimIt->second;
 
     op->routingTarget.chainVer = slimChain.version;
     op->routingTarget.routingInfoVer = slimChain.routingInfoVer;
@@ -600,7 +602,7 @@ std::vector<Op *> selectRoutingTargetForOps(ClientRequestContext &requestCtx,
             slimChain.chainId,
             slimChain.version,
             options.trafficZone(),
-            chainInfos[chainId]);
+            getChainInfo(routingInfo, hf3fs::flat::ChainId(chainId)));
       setErrorCodeOfOp(op, StorageClientCode::kNotAvailable);
       continue;
     }
@@ -615,7 +617,7 @@ std::vector<Op *> selectRoutingTargetForOps(ClientRequestContext &requestCtx,
             slimChain.chainId,
             slimChain.version,
             toStringView(options.mode()),
-            chainInfos[chainId]);
+            getChainInfo(routingInfo, hf3fs::flat::ChainId(chainId)));
       setErrorCodeOfOp(op, selectedTarget.error().code());
       continue;
     }

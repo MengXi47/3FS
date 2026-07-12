@@ -14,21 +14,31 @@ folly::AtomicUnorderedInsertMap<ChainId, folly::MutableAtom<uint64_t>> nextTarge
 class LoadBalanceStrategy : public TargetSelectionStrategy {
  public:
   LoadBalanceStrategy(const TargetSelectionOptions &options)
-      : TargetSelectionStrategy(options),
-        numIOs(kNodeIdKeyedMapExpectedNumElements) {}
+      : TargetSelectionStrategy(options) {}
 
   Result<SlimTargetInfo> selectTarget(const SlimChainInfo &chain) override {
     uint32_t targetIndex = folly::Random::rand32(0, chain.servingTargets.size());
     SlimTargetInfo preferredTarget = chain.servingTargets[targetIndex];
     auto [preferredIt, succ] = numAccumIOs.emplace(preferredTarget.nodeId, 0);
+    uint64_t preferredNumIOs = numIOs[preferredTarget.nodeId];
 
     for (const auto &target : chain.servingTargets) {
-      if (numIOs[target.nodeId] < numIOs[preferredTarget.nodeId]) {
+      if (target.nodeId == preferredTarget.nodeId) {
+        continue;
+      }
+      auto targetNumIOs = numIOs[target.nodeId];  // one lookup per target instead of two
+      if (targetNumIOs < preferredNumIOs) {
+        auto [currentIt, succ1] = numAccumIOs.emplace(target.nodeId, 0);
         preferredTarget = target;
-      } else if (target.nodeId != preferredTarget.nodeId && numIOs[target.nodeId] == numIOs[preferredTarget.nodeId]) {
+        preferredNumIOs = targetNumIOs;
+        // keep the accumulated counter in sync with the preferred target, so the
+        // final increment and tie-breaking below apply to the right node.
+        std::memcpy(&preferredIt, &currentIt, sizeof(preferredIt));
+      } else if (targetNumIOs == preferredNumIOs) {
         auto [currentIt, succ1] = numAccumIOs.emplace(target.nodeId, 0);
         if (currentIt->second.data < preferredIt->second.data) {
           preferredTarget = target;
+          preferredNumIOs = targetNumIOs;
           std::memcpy(&preferredIt, &currentIt, sizeof(preferredIt));
         }
       }

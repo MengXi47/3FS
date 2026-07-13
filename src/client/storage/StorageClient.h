@@ -419,7 +419,11 @@ class StorageClient : public folly::MoveOnly {
     CONFIG_ITEM(create_net_client_for_updates, false);
     CONFIG_HOT_UPDATED_ITEM(check_overlapping_read_buffers, true);
     CONFIG_HOT_UPDATED_ITEM(check_overlapping_write_buffers, false);
-    CONFIG_HOT_UPDATED_ITEM(max_inline_read_bytes, Size{0});
+    // batches smaller than this ride inline in the RPC response instead of a
+    // dedicated RDMA write: two small memcpys replace a doorbell + CQE +
+    // completion wakeup round, and the server-side write semaphore/QP slot
+    // is not consumed at all. 0 disables inlining.
+    CONFIG_HOT_UPDATED_ITEM(max_inline_read_bytes, Size{4_KB});
     CONFIG_HOT_UPDATED_ITEM(max_inline_write_bytes, Size{0});
     CONFIG_HOT_UPDATED_ITEM(max_read_io_bytes, Size{0});
   };

@@ -39,12 +39,37 @@ class PioV {
   void finishIo(bool allowHoles);
 
  private:
-  Result<Void> chunkIo(
-      const meta::Inode &inode,
-      uint16_t track,
-      off_t off,
-      size_t len,
-      std::function<void(storage::ChainId, storage::ChunkId, uint32_t, uint32_t, uint32_t)> &&consumeChunk);
+  // templated on the chunk consumer: a std::function here would heap-allocate
+  // for every user IO (the capture list exceeds the small-buffer size).
+  template <typename ConsumeChunk>
+  Result<Void> chunkIo(const meta::Inode &inode, uint16_t track, off_t off, size_t len, ConsumeChunk &&consumeChunk) {
+    const auto &f = inode.asFile();
+    auto chunkSize = f.layout.chunkSize;
+    auto chunkOff = off % chunkSize;
+
+    auto rcs = chunkSizeLim_ ? std::min((size_t)chunkSizeLim_, chunkSize.u64()) : chunkSize.u64();
+
+    for (size_t lastL = 0, l = std::min((size_t)(chunkSize - chunkOff), len);  // l is within a chunk
+         l < len + chunkSize;                                                  // for the last chunk
+         lastL = l, l += chunkSize) {
+      l = std::min(l, len);  // l is always growing longer
+      auto opOff = off + lastL;
+
+      auto chain = f.getChainId(inode, opOff, *routingInfo_, track);
+      RETURN_ON_ERROR(chain);
+      auto fchunk = f.getChunkId(inode.id, opOff);
+      RETURN_ON_ERROR(fchunk);
+      auto chunk = storage::ChunkId(*fchunk);
+      auto chunkLen = l - lastL;
+
+      for (size_t co = 0; co < chunkLen; co += rcs) {
+        consumeChunk(*chain, chunk, chunkSize, chunkOff + co, std::min(rcs, chunkLen - co));
+      }
+
+      chunkOff = 0;  // chunks other than first always starts from 0
+    }
+    return Void{};
+  }
 
  private:
   storage::client::StorageClient &storageClient_;

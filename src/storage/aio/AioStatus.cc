@@ -185,10 +185,12 @@ Result<Void> IoUringStatus::init(uint32_t maxEvents,
   maxEvents_ = maxEvents;
 
   // each worker thread owns its ring exclusively (init/submit/reap all run on
-  // the same thread), so SINGLE_ISSUER applies; COOP_TASKRUN avoids IPI-based
-  // completion interrupts. older kernels reject unknown flags with EINVAL, so
-  // fall back step by step.
+  // the same thread), so SINGLE_ISSUER applies; DEFER_TASKRUN (6.1+) defers
+  // all completion work to io_uring_enter with GETEVENTS (our wait_cqes),
+  // COOP_TASKRUN (5.19+) merely avoids IPI-based interrupts. older kernels
+  // reject unknown flags with EINVAL, so fall back step by step.
   static constexpr unsigned kSetupFlags[] = {
+      IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN,
       IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN,
       IORING_SETUP_COOP_TASKRUN,
       0,

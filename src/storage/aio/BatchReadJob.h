@@ -1,7 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <folly/MPMCQueue.h>
 #include <folly/experimental/coro/Baton.h>
+#include <folly/fibers/Semaphore.h>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -100,14 +103,24 @@ class BatchReadJob {
   size_t copyToRespBuffer(std::vector<uint8_t> &buffer);
   void finish(AioReadJob *job);
 
-  // Wave support: split jobs into fixed-size waves so RDMA writes of finished
-  // disk reads can start while the rest of the batch is still on disk.
-  void initWaves(uint32_t waveSize);
-  uint32_t numWaves() const { return waves_.size(); }
-  CoTask<void> waitWave(uint32_t index) { co_await waves_[index].baton; }
-  CoTask<void> anyWaveReady() { co_await anyWaveReady_; }
-  size_t addWaveToBatch(uint32_t index, serde::CallContext::RDMATransmission &batch);
-  void setWaveError(uint32_t index, const Status &error);
+  // Completion-driven transmission: finished jobs enter a lock-free queue in
+  // disk-completion order, so the sender can transmit whatever is ready
+  // without waiting for any predefined grouping (waves of submission-index
+  // neighbors stall on the slowest disk in the group when a batch spans
+  // multiple targets).
+  void initCompletionQueue();
+  CoTask<AioReadJob *> takeReady();
+  bool tryTakeReady(AioReadJob *&job);
+  size_t addJobsToBatch(std::span<AioReadJob *const> jobs, serde::CallContext::RDMATransmission &batch);
+  void setJobsError(std::span<AioReadJob *const> jobs, const Status &error);
+  void beginGroupPost() { pendingPosts_.fetch_add(1, std::memory_order_relaxed); }
+  void onGroupPosted() {
+    if (pendingPosts_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      allPostsDone_.post();
+    }
+  }
+  void senderDone() { onGroupPosted(); }
+  CoTask<void> allPostsDone() { co_await allPostsDone_; }
   bool anyPostFailed() const { return anyPostFailed_.load(std::memory_order_relaxed); }
   auto checksumType() const { return checksumType_; }
   bool recalculateChecksum() const { return recalculateChecksum_; }
@@ -121,20 +134,17 @@ class BatchReadJob {
   friend class AioReadJobIterator;
   size_t addRangeToBatch(serde::CallContext::RDMATransmission &batch, size_t begin, size_t end);
 
-  struct WaveState {
-    std::atomic<uint32_t> remaining{};
-    folly::coro::Baton baton;
-  };
-
   std::vector<AioReadJob> jobs_;
   folly::coro::Baton baton_;
   std::atomic<uint64_t> finishedCount_{};
   std::atomic<RelativeTime> startTime_ = RelativeTime::now();
   const ChecksumType checksumType_;
   bool recalculateChecksum_ = false;
-  uint32_t waveSize_ = 0;
-  std::vector<WaveState> waves_;
-  folly::coro::Baton anyWaveReady_;
+  bool completionDriven_ = false;
+  folly::MPMCQueue<AioReadJob *> readyQueue_;
+  folly::fibers::Semaphore readySem_{0};
+  std::atomic<size_t> pendingPosts_{1};  // 1 = the sender loop itself
+  folly::coro::Baton allPostsDone_;
   std::atomic<bool> anyPostFailed_{false};
 };
 

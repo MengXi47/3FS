@@ -2,6 +2,7 @@
 
 #include <folly/concurrency/ConcurrentHashMap.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/small_vector.h>
 
 #include "analytics/StructuredTraceLog.h"
 #include "client/mgmtd/IMgmtdClientForServer.h"
@@ -36,9 +37,9 @@ class StorageOperator {
     // split large batches across multiple AIO worker threads so metadata
     // lookup, submission and reaping run in parallel per segment.
     CONFIG_HOT_UPDATED_ITEM(batch_read_job_split_size, uint32_t{128});
-    // pipeline disk reads with RDMA writes: post finished waves of this many IOs
-    // while the rest of the batch is still reading from disk. 0 = wait for the
-    // whole batch before transmitting (old barrier behavior).
+    // pipeline disk reads with RDMA writes: transmit jobs in disk-completion
+    // order, at most this many per post (matches max_rdma_wr_per_post).
+    // 0 = wait for the whole batch before transmitting (barrier behavior).
     CONFIG_HOT_UPDATED_ITEM(batch_read_rdma_wave_size, uint32_t{32});
     CONFIG_HOT_UPDATED_ITEM(post_buffer_per_bytes, 64_KB);
     CONFIG_HOT_UPDATED_ITEM(batch_read_ignore_chain_version, false);
@@ -106,10 +107,10 @@ class StorageOperator {
  protected:
   using ChunkMetadataProcessor = std::function<CoTryTask<void>(const ChunkId &, const ChunkMetadata &)>;
 
-  CoTask<void> postReadWave(ServiceRequestContext &requestCtx,
-                            BatchReadJob &batch,
-                            serde::CallContext &ctx,
-                            uint32_t waveIndex);
+  CoTask<void> postReadGroup(ServiceRequestContext &requestCtx,
+                             BatchReadJob &batch,
+                             serde::CallContext &ctx,
+                             folly::small_vector<AioReadJob *, 32> group);
 
   CoTask<IOResult> handleUpdate(ServiceRequestContext &requestCtx,
                                 UpdateReq &req,

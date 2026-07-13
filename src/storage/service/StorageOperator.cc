@@ -1,8 +1,9 @@
 #include "storage/service/StorageOperator.h"
 
+#include <algorithm>
 #include <boost/range/adaptor/reversed.hpp>
 #include <fmt/format.h>
-#include <folly/experimental/coro/Collect.h>
+#include <folly/experimental/coro/CurrentExecutor.h>
 #include <folly/small_vector.h>
 
 #include "common/monitor/Recorder.h"
@@ -194,7 +195,7 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
             pipelineIbSocket->device()->name());
       co_return makeError(RPCCode::kIBDeviceNotFound);
     }
-    batch.initWaves(waveSize);
+    batch.initCompletionQueue();
   }
 
   if (BITFLAGS_CONTAIN(req.featureFlags, FeatureFlags::BYPASS_DISKIO)) {
@@ -291,10 +292,10 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
       co_await controlBatch.applyTransmission(RDMATransmissionReqTimeout);
     }
 
-    // wait until the first wave of disk reads is ready before taking the
-    // semaphore, so the token is not held during pure disk latency.
+    // wait until the first disk read finishes before taking the semaphore,
+    // so the token is not held during pure disk latency.
     auto waitAioRecordGuard = storageWaitAioRecorder.record();
-    co_await batch.anyWaveReady();
+    auto *pendingJob = co_await batch.takeReady();
     waitAioRecordGuard.report(true);
 
     auto ibdevTagSet = monitor::instanceTagSet(ibSocket->device()->name());
@@ -308,15 +309,34 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
       co_await controlBatch.applyTransmission(RDMATransmissionReqTimeout);
     }
 
-    // post each wave as soon as its disk reads finish; waves transfer in
-    // parallel so disk IO overlaps with network transmission.
+    // completion-driven sender: drain whatever finished, spawn a concurrent
+    // post for each group, then wait for the next completion. slow network
+    // naturally accumulates larger groups (fewer doorbells per byte); disk IO
+    // overlaps transmission with per-job granularity.
     auto waitPostRecordGuard = storageWaitPostRecorder.record(ibdevTagSet);
-    folly::small_vector<CoTask<void>, 8> waveTasks;  // ≤256-IO batches stay allocation-free
-    waveTasks.reserve(batch.numWaves());
-    for (uint32_t waveIndex = 0; waveIndex < batch.numWaves(); ++waveIndex) {
-      waveTasks.push_back(postReadWave(requestCtx, batch, ctx, waveIndex));
+    auto executor = co_await folly::coro::co_current_executor;
+    size_t groupCap = std::max(1u, waveSize);
+    size_t processed = 0;
+    while (true) {
+      folly::small_vector<AioReadJob *, 32> group;
+      group.push_back(pendingJob);
+      while (group.size() < groupCap) {
+        AioReadJob *more = nullptr;
+        if (!batch.tryTakeReady(more)) {
+          break;
+        }
+        group.push_back(more);
+      }
+      processed += group.size();
+      batch.beginGroupPost();
+      postReadGroup(requestCtx, batch, ctx, std::move(group)).scheduleOn(executor).start();
+      if (processed >= batchSize) {
+        break;
+      }
+      pendingJob = co_await batch.takeReady();
     }
-    co_await folly::coro::collectAllRange(std::move(waveTasks));
+    batch.senderDone();
+    co_await batch.allPostsDone();
     if (LIKELY(!batch.anyPostFailed())) {
       waitPostRecordGuard.succ();
     }
@@ -327,19 +347,23 @@ CoTryTask<BatchReadRsp> StorageOperator::batchRead(ServiceRequestContext &reques
   co_return rsp;
 }
 
-CoTask<void> StorageOperator::postReadWave(ServiceRequestContext &requestCtx,
-                                           BatchReadJob &batch,
-                                           serde::CallContext &ctx,
-                                           uint32_t waveIndex) {
-  co_await batch.waitWave(waveIndex);
-  auto waveBatch = ctx.writeTransmission();
-  batch.addWaveToBatch(waveIndex, waveBatch);
+CoTask<void> StorageOperator::postReadGroup(ServiceRequestContext &requestCtx,
+                                            BatchReadJob &batch,
+                                            serde::CallContext &ctx,
+                                            folly::small_vector<AioReadJob *, 32> group) {
+  // jobs arrive in completion order; jobs_ storage is contiguous so sorting by
+  // pointer restores request-index order and maximizes WR coalescing of
+  // adjacent remote ranges.
+  std::sort(group.begin(), group.end());
+  auto groupBatch = ctx.writeTransmission();
+  batch.addJobsToBatch({group.data(), group.size()}, groupBatch);
   auto postResult = FAULT_INJECTION_POINT(requestCtx.debugFlags.injectServerError(),
                                           makeError(RPCCode::kRDMAPostFailed),
-                                          (co_await waveBatch.post()));
+                                          (co_await groupBatch.post()));
   if (UNLIKELY(!postResult)) {
-    batch.setWaveError(waveIndex, postResult.error());
+    batch.setJobsError({group.data(), group.size()}, postResult.error());
   }
+  batch.onGroupPosted();
 }
 
 CoTryTask<WriteRsp> StorageOperator::write(ServiceRequestContext &requestCtx,

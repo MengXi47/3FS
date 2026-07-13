@@ -99,31 +99,58 @@ size_t BatchReadJob::addRangeToBatch(serde::CallContext::RDMATransmission &batch
   return writeBytes;
 }
 
-void BatchReadJob::initWaves(uint32_t waveSize) {
-  waveSize_ = std::min<size_t>(waveSize, jobs_.size());
-  if (waveSize_ == 0) {
-    return;
-  }
-  auto numWaves = (jobs_.size() + waveSize_ - 1) / waveSize_;
-  waves_ = std::vector<WaveState>(numWaves);
-  for (auto i = 0ul; i < numWaves; ++i) {
-    waves_[i].remaining.store(std::min<size_t>(waveSize_, jobs_.size() - i * waveSize_), std::memory_order_relaxed);
-  }
+void BatchReadJob::initCompletionQueue() {
+  readyQueue_ = folly::MPMCQueue<AioReadJob *>(jobs_.size());
+  completionDriven_ = true;
 }
 
-size_t BatchReadJob::addWaveToBatch(uint32_t index, serde::CallContext::RDMATransmission &batch) {
-  auto begin = size_t(index) * waveSize_;
-  auto end = std::min(begin + waveSize_, jobs_.size());
-  return addRangeToBatch(batch, begin, end);
+CoTask<AioReadJob *> BatchReadJob::takeReady() {
+  co_await readySem_.co_wait();
+  AioReadJob *job = nullptr;
+  auto succ = readyQueue_.read(job);
+  assert(succ);
+  (void)succ;
+  co_return job;
 }
 
-void BatchReadJob::setWaveError(uint32_t index, const Status &error) {
-  auto begin = size_t(index) * waveSize_;
-  auto end = std::min(begin + waveSize_, jobs_.size());
-  for (auto i = begin; i < end; ++i) {
-    auto &job = jobs_[i];
+bool BatchReadJob::tryTakeReady(AioReadJob *&job) {
+  if (!readySem_.try_wait()) {
+    return false;
+  }
+  auto succ = readyQueue_.read(job);
+  assert(succ);
+  (void)succ;
+  return true;
+}
+
+size_t BatchReadJob::addJobsToBatch(std::span<AioReadJob *const> jobs, serde::CallContext::RDMATransmission &batch) {
+  batch.reserve(jobs.size(), jobs.size());
+  size_t writeCount = 0;
+  size_t writeBytes = 0;
+  for (auto *jobPtr : jobs) {
+    auto &job = *jobPtr;
     if (job.result().lengthInfo) {
-      job.result().lengthInfo = makeError(error);
+      auto length = *job.result().lengthInfo;
+      auto localbuf = job.state().localbuf.subrange(job.state().headLength, length);
+      auto result = batch.add(job.readIO().rdmabuf, localbuf);
+      if (UNLIKELY(!result)) {
+        rdmaWriteFails.addSample(1);
+        job.result().lengthInfo = makeError(std::move(result.error()));
+      } else {
+        ++writeCount;
+        writeBytes += length;
+      }
+    }
+  }
+  rdmaWriteCount.addSample(writeCount);
+  rdmaWriteBytes.addSample(writeBytes);
+  return writeBytes;
+}
+
+void BatchReadJob::setJobsError(std::span<AioReadJob *const> jobs, const Status &error) {
+  for (auto *job : jobs) {
+    if (job->result().lengthInfo) {
+      job->result().lengthInfo = makeError(error);
     }
   }
   anyPostFailed_.store(true, std::memory_order_relaxed);
@@ -153,13 +180,11 @@ size_t BatchReadJob::copyToRespBuffer(std::vector<uint8_t> &buffer) {
 }
 
 void BatchReadJob::finish(AioReadJob *job) {
-  if (!waves_.empty()) {
-    auto waveIndex = static_cast<size_t>(job - jobs_.data()) / waveSize_;
-    assert(waveIndex < waves_.size());
-    if (waves_[waveIndex].remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-      waves_[waveIndex].baton.post();
-      anyWaveReady_.post();  // idempotent, first ready wave wins
-    }
+  if (completionDriven_) {
+    // job result is fully written before this point; the queue write/read pair
+    // and the semaphore provide the release/acquire edge to the sender.
+    readyQueue_.write(job);
+    readySem_.signal();
   }
   if (++finishedCount_ == jobs_.size()) {
     batchReadLatency.addSample(RelativeTime::now() - startTime());

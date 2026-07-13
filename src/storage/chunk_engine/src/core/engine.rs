@@ -78,6 +78,16 @@ impl Engine {
         self.allocators.used_size()
     }
 
+    // all direct fds owned by this engine (one per cluster file, fixed after
+    // open); used by the C++ side to register them with io_uring at startup.
+    pub fn all_fds(&self) -> Vec<i32> {
+        self.allocators
+            .vec
+            .iter()
+            .flat_map(|allocator| allocator.clusters.all_fds())
+            .collect()
+    }
+
     pub fn allocate_groups(
         &self,
         min_remain: usize,

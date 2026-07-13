@@ -60,6 +60,15 @@ impl Clusters {
             offset: pos.offset().into(),
         }
     }
+
+    // all direct fds of this cluster set; the fd set is fixed after open(),
+    // so callers may register them with io_uring once at startup.
+    pub fn all_fds(&self) -> Vec<i32> {
+        self.files
+            .iter()
+            .map(|cluster| cluster.direct_fd.as_raw_fd())
+            .collect()
+    }
 }
 
 impl Debug for Clusters {

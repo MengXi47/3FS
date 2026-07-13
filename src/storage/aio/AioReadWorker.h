@@ -78,6 +78,9 @@ class AioReadWorker {
   folly::CPUThreadPoolExecutor executors_;
   std::atomic<uint32_t> initialized_{};
   folly::Synchronized<Result<Void>, std::mutex> initResult_{Void{}};
+  // fd value → io_uring registered file index; -1 = unregistered. built once
+  // in start() and shared read-only by all worker rings.
+  std::vector<int32_t> fdToRegisteredIndex_;
 };
 
 }  // namespace hf3fs::storage

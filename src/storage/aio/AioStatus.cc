@@ -180,7 +180,8 @@ IoUringStatus::~IoUringStatus() {
 
 Result<Void> IoUringStatus::init(uint32_t maxEvents,
                                  const std::vector<int> &fds,
-                                 const std::vector<struct iovec> &iovecs) {
+                                 const std::vector<struct iovec> &iovecs,
+                                 const std::vector<int32_t> *fdToRegisteredIndex) {
   maxEvents_ = maxEvents;
 
   // each worker thread owns its ring exclusively (init/submit/reap all run on
@@ -216,9 +217,13 @@ Result<Void> IoUringStatus::init(uint32_t maxEvents,
   if (!fds.empty()) {
     int ret = ::io_uring_register_files(&ring_, fds.data(), fds.size());
     if (UNLIKELY(ret != 0)) {
-      auto msg = fmt::format("io_uring_register_files failed: {}, size: {}", ret, fds.size());
-      XLOG(ERR, msg);
-      return makeError(StatusCode::kInvalidConfig, std::move(msg));
+      // not fatal: older kernels cap the registered file table (e.g. 32768
+      // before 5.13) and chunk engine deployments may exceed it — fall back
+      // to raw fds instead of failing startup.
+      XLOGF(WARN, "io_uring_register_files failed: {}, size: {}, fallback to raw fds", ret, fds.size());
+    } else {
+      registeredFiles_ = true;
+      fdToRegisteredIndex_ = fdToRegisteredIndex;
     }
   }
   if (!iovecs.empty()) {
@@ -246,16 +251,31 @@ void IoUringStatus::collect() {
     ++inflight_;
     auto &state = job.state();
 
+    // registered fd index: the chunk store path fills state.fdIndex itself,
+    // the chunk engine path only provides a raw fd — resolve it via the
+    // shared table so both use the IOSQE_FIXED_FILE fast path.
+    std::optional<uint32_t> fdIndex;
+    if (registeredFiles_) {
+      fdIndex = state.fdIndex;
+      if (!fdIndex && fdToRegisteredIndex_ != nullptr && state.readFd >= 0 &&
+          size_t(state.readFd) < fdToRegisteredIndex_->size()) {
+        auto registered = (*fdToRegisteredIndex_)[state.readFd];
+        if (registered >= 0) {
+          fdIndex = uint32_t(registered);
+        }
+      }
+    }
+
     job.resetStartTime();
     struct io_uring_sqe *sqe = ::io_uring_get_sqe(&ring_);
     assert(sqe != nullptr);
     ::io_uring_prep_read_fixed(sqe,
-                               state.fdIndex.value_or(state.readFd),
+                               fdIndex.value_or(state.readFd),
                                state.localbuf.ptr(),
                                state.readLength,
                                state.readOffset,
                                state.bufferIndex);
-    if (state.fdIndex) {
+    if (fdIndex) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
     ::io_uring_sqe_set_data(sqe, &job);

@@ -216,6 +216,13 @@ Result<Void> StorageTargets::load(CPUExecutorGroup &executor) {
   }
   if (config_.collect_all_fds()) {
     globalFileStore_.collect(fds_);
+    // chunk engine cluster files are opened once and fixed afterwards: append
+    // their direct fds so engine reads can use io_uring registered files too.
+    for (auto &engine : engines_) {
+      auto engineFds = engine->all_fds();
+      fds_.reserve(fds_.size() + engineFds.size());
+      fds_.insert(fds_.end(), engineFds.begin(), engineFds.end());
+    }
   }
   return Void{};
 }

@@ -465,6 +465,7 @@ pub mod ffi {
         fn release(engine: Box<Engine>);
 
         fn raw_used_size(&self) -> RawUsedSize;
+        fn all_fds(&self) -> Vec<i32>;
         fn allocate_groups(&self, min_remain: usize, max_remain: usize, batch_size: usize)
             -> usize;
         fn allocate_ultra_groups(

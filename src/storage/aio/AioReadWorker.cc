@@ -1,5 +1,6 @@
 #include "storage/aio/AioReadWorker.h"
 
+#include <algorithm>
 #include <folly/ScopeGuard.h>
 #include <folly/logging/xlog.h>
 #include <folly/system/ThreadName.h>
@@ -16,6 +17,18 @@ monitor::CountRecorder aioRunningThreadsCount{"storage.aio_running_threads.count
 AioReadWorker::~AioReadWorker() { stopAndJoin(); }
 
 Result<Void> AioReadWorker::start(const std::vector<int> &fds, const std::vector<struct iovec> &iovecs) {
+  // flat fd → registered-index table shared read-only by all worker rings.
+  int maxFd = -1;
+  for (auto fd : fds) {
+    maxFd = std::max(maxFd, fd);
+  }
+  fdToRegisteredIndex_.assign(maxFd < 0 ? 0 : size_t(maxFd) + 1, -1);
+  for (size_t i = 0; i < fds.size(); ++i) {
+    if (fds[i] >= 0) {
+      fdToRegisteredIndex_[fds[i]] = int32_t(i);
+    }
+  }
+
   uint32_t numThreads = config_.num_threads();
   for (auto i = 0u; i < numThreads; ++i) {
     executors_.add([&]() {
@@ -30,7 +43,7 @@ Result<Void> AioReadWorker::start(const std::vector<int> &fds, const std::vector
           return;
         }
         if (config_.enable_io_uring()) {
-          auto ioUringResult = ioUringStatus.init(config_.max_events(), fds, iovecs);
+          auto ioUringResult = ioUringStatus.init(config_.max_events(), fds, iovecs, &fdToRegisteredIndex_);
           if (UNLIKELY(!ioUringResult)) {
             XLOGF(ERR, "io uring status init failed: {}", ioUringResult.error());
             *initResult_.lock() = std::move(ioUringResult);

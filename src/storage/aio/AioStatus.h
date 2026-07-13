@@ -57,7 +57,10 @@ class IoUringStatus : public IoStatus {
  public:
   ~IoUringStatus() override;
 
-  Result<Void> init(uint32_t maxEvents, const std::vector<int> &fds, const std::vector<struct iovec> &iovecs);
+  Result<Void> init(uint32_t maxEvents,
+                    const std::vector<int> &fds,
+                    const std::vector<struct iovec> &iovecs,
+                    const std::vector<int32_t> *fdToRegisteredIndex);
 
   void collect() override;
 
@@ -68,6 +71,10 @@ class IoUringStatus : public IoStatus {
  private:
   struct io_uring ring_ {};
   std::vector<AioReadJob *> submittingJobs_;
+  // fd value → io_uring registered file index (shared, built once at startup);
+  // only consulted when file registration succeeded.
+  const std::vector<int32_t> *fdToRegisteredIndex_ = nullptr;
+  bool registeredFiles_ = false;
 };
 
 }  // namespace hf3fs::storage

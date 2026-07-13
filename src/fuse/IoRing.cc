@@ -1,5 +1,6 @@
 #include "IoRing.h"
 
+#include <algorithm>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -89,6 +90,9 @@ CoTask<void> IoRing::process(
   auto start = SteadyClock::now(), overallStart = start;
   std::string ioType = forRead_ ? "read" : "write";
   auto uids = std::to_string(userInfo_.uid.toUnderType());
+  // one tag set for the whole job: building it per sample costs two string
+  // copies plus recorder-map probes, which is measurable per-IO overhead.
+  auto perIoTagSet = monitor::TagSet{{"io", ioType}, {"uid", uids}};
 
   auto &config = userConfig.getConfig(userInfo_);
 
@@ -99,8 +103,12 @@ CoTask<void> IoRing::process(
     res = std::vector<ssize_t>(toProc, 0);
 
     size_t iod = 0, totalBytes = 0;
-    std::set<uint64_t> distinctFiles;
-    std::set<Uuid> distinctBufs;
+    // collect then sort+unique once: a std::set pays one node allocation per
+    // IO just to count distinct elements.
+    std::vector<uint64_t> distinctFiles;
+    distinctFiles.reserve(toProc);
+    std::vector<Uuid> distinctBufs;
+    distinctBufs.reserve(toProc);
 
     std::vector<std::shared_ptr<RcInode>> inodes;
     inodes.reserve(toProc);
@@ -130,13 +138,13 @@ CoTask<void> IoRing::process(
 
       ++iod;
       totalBytes += args.ioLen;
-      distinctFiles.insert(args.fileIid);
+      distinctFiles.push_back(args.fileIid);
 
       Uuid id;
       memcpy(id.data, args.bufId, sizeof(id.data));
-      distinctBufs.insert(id);
+      distinctBufs.push_back(id);
 
-      ioSizeDist.addSample(args.ioLen, monitor::TagSet{{"io", ioType}, {"uid", uids}});
+      ioSizeDist.addSample(args.ioLen, perIoTagSet);
 
       if (!inodes[i]) {
         res[i] = -static_cast<ssize_t>(MetaCode::kNotFile);
@@ -177,13 +185,18 @@ CoTask<void> IoRing::process(
     }
 
     auto now = SteadyClock::now();
-    prepareLatency.addSample(now - start, monitor::TagSet{{"io", ioType}, {"uid", uids}});
+    prepareLatency.addSample(now - start, perIoTagSet);
     start = now;
 
-    ioDepthDist.addSample(iod, monitor::TagSet{{"io", ioType}, {"uid", uids}});
-    totalBytesDist.addSample(totalBytes, monitor::TagSet{{"io", ioType}, {"uid", uids}});
-    distinctFilesDist.addSample(distinctFiles.size(), monitor::TagSet{{"io", ioType}, {"uid", uids}});
-    distinctBufsDist.addSample(distinctBufs.size(), monitor::TagSet{{"io", ioType}, {"uid", uids}});
+    std::sort(distinctFiles.begin(), distinctFiles.end());
+    auto distinctFileCount = std::unique(distinctFiles.begin(), distinctFiles.end()) - distinctFiles.begin();
+    std::sort(distinctBufs.begin(), distinctBufs.end());
+    auto distinctBufCount = std::unique(distinctBufs.begin(), distinctBufs.end()) - distinctBufs.begin();
+
+    ioDepthDist.addSample(iod, perIoTagSet);
+    totalBytesDist.addSample(totalBytes, perIoTagSet);
+    distinctFilesDist.addSample(distinctFileCount, perIoTagSet);
+    distinctBufsDist.addSample(distinctBufCount, perIoTagSet);
 
     auto readOpt = storageIo.read();
     if (flags_ & HF3FS_IOR_ALLOW_READ_UNCOMMITTED) {
@@ -193,7 +206,7 @@ CoTask<void> IoRing::process(
                                       : ioExec.executeWrite(userInfo_, storageIo.write()));
 
     now = SteadyClock::now();
-    submitLatency.addSample(now - start, monitor::TagSet{{"io", ioType}, {"uid", uids}});
+    submitLatency.addSample(now - start, perIoTagSet);
     start = now;
 
     if (!execRes) {
@@ -276,10 +289,10 @@ CoTask<void> IoRing::process(
       doneBytes += r;
     }
   }
-  bwCount.addSample(doneBytes, monitor::TagSet{{"io", ioType}, {"uid", uids}});
+  bwCount.addSample(doneBytes, perIoTagSet);
 
   auto now = SteadyClock::now();
-  completeLatency.addSample(now - start, monitor::TagSet{{"io", ioType}, {"uid", uids}});
-  overallLatency.addSample(now - overallStart, monitor::TagSet{{"io", ioType}, {"uid", uids}});
+  completeLatency.addSample(now - start, perIoTagSet);
+  overallLatency.addSample(now - overallStart, perIoTagSet);
 }
 }  // namespace hf3fs::fuse

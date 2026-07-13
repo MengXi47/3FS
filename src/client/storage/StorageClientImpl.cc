@@ -896,9 +896,8 @@ std::vector<IO *> validateDataRange(const std::vector<IO *> &ios, bool checkOver
     std::sort(begin(sortedIOs), end(sortedIOs), [](const IO *a, const IO *b) { return a->data < b->data; });
   }
 
-  std::vector<IO *> validIOs;
-  validIOs.reserve(ios.size());
-
+  // validation is all-or-nothing: on success every IO is returned, so reuse
+  // sortedIOs instead of building a second identical vector.
   IO *lastIO = nullptr;
 
   for (size_t ioIndex = 0; ioIndex < sortedIOs.size(); ioIndex++) {
@@ -945,11 +944,10 @@ std::vector<IO *> validateDataRange(const std::vector<IO *> &ios, bool checkOver
       return {};
     }
 
-    validIOs.push_back(io);
     lastIO = io;
   }
 
-  return validIOs;
+  return sortedIOs;
 }
 
 std::vector<ReadIO *> splitReadIOs(StorageClientImpl &client,

@@ -33,14 +33,20 @@ Result<Void> BufferPool::init(CPUExecutorGroup &executor) {
   auto smallBufferResult =
       initBuffers(executor, config_.rdmabuf_size(), config_.rdmabuf_count(), UIO_MAXIOV / 2, buffers_);
   RETURN_AND_LOG_ON_ERROR(smallBufferResult);
-  *freeIndex_.lock() = std::move(*smallBufferResult);
+  freeIndex_ = folly::MPMCQueue<BufferIndex>(smallBufferResult->size());
+  for (auto &index : *smallBufferResult) {
+    freeIndex_.write(std::move(index));
+  }
 
   bigBufferRegisterIndexStart_ = buffers_.size();
 
   auto bigBufferResult =
       initBuffers(executor, config_.big_rdmabuf_size(), config_.big_rdmabuf_count(), UIO_MAXIOV / 2, buffers_);
   RETURN_AND_LOG_ON_ERROR(bigBufferResult);
-  *bigFreeIndex_.lock() = std::move(*bigBufferResult);
+  bigFreeIndex_ = folly::MPMCQueue<BufferIndex>(bigBufferResult->size());
+  for (auto &index : *bigBufferResult) {
+    bigFreeIndex_.write(std::move(index));
+  }
 
   iovecs_.clear();
   iovecs_.reserve(buffers_.size());
@@ -155,27 +161,30 @@ void BufferPool::clear(CPUExecutorGroup &executor) {
 }
 
 BufferIndex BufferPool::allocate() {
-  auto guard = freeIndex_.lock();
-  assert(!guard->empty());
-  auto ret = guard->back();
-  guard->pop_back();
-  return ret;
+  // the caller holds a semaphore token, so the queue cannot be empty.
+  BufferIndex index;
+  auto succ = freeIndex_.read(index);
+  assert(succ);
+  (void)succ;
+  return index;
 }
 
 BufferIndex BufferPool::allocateBig() {
-  auto guard = bigFreeIndex_.lock();
-  assert(!guard->empty());
-  auto ret = guard->back();
-  guard->pop_back();
-  return ret;
+  BufferIndex index;
+  auto succ = bigFreeIndex_.read(index);
+  assert(succ);
+  (void)succ;
+  return index;
 }
 
 void BufferPool::deallocate(const BufferIndex &index) {
+  // write before signal so a successful semaphore wait implies a readable entry;
+  // capacity equals the total index count, so the write cannot fail.
   if (UNLIKELY(index.registerIndex >= bigBufferRegisterIndexStart_)) {
-    bigFreeIndex_.lock()->push_back(index);
+    bigFreeIndex_.write(index);
     bigSemaphore_.signal();
   } else {
-    freeIndex_.lock()->push_back(index);
+    freeIndex_.write(index);
     semaphore_.signal();
   }
 }

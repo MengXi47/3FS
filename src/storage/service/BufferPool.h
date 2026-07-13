@@ -1,6 +1,6 @@
 #pragma once
 
-#include <folly/Synchronized.h>
+#include <folly/MPMCQueue.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/fibers/Semaphore.h>
 #include <limits>
@@ -80,13 +80,15 @@ class BufferPool {
   Size rdmabufSize_;
   std::vector<net::RDMABuf> buffers_;
   std::vector<struct iovec> iovecs_;
+  // the semaphores gate availability; the lock-free queues just hand out
+  // indices, so a successful semaphore wait guarantees a non-empty queue.
   folly::fibers::Semaphore semaphore_;
-  folly::Synchronized<std::vector<BufferIndex>, std::mutex> freeIndex_;
+  folly::MPMCQueue<BufferIndex> freeIndex_;
 
   Size bigRdmabufSize_;
   uint32_t bigBufferRegisterIndexStart_ = 0;
   folly::fibers::Semaphore bigSemaphore_;
-  folly::Synchronized<std::vector<BufferIndex>, std::mutex> bigFreeIndex_;
+  folly::MPMCQueue<BufferIndex> bigFreeIndex_;
 };
 
 }  // namespace hf3fs::storage

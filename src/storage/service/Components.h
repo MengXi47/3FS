@@ -56,7 +56,13 @@ struct Components {
     CONFIG_OBJ(allocate_worker, AllocateWorker::Config);
     CONFIG_OBJ(sync_meta_kv_worker, SyncMetaKvWorker::Config);
     CONFIG_OBJ(forward_client, net::Client::Config);
-    CONFIG_OBJ(coroutines_pool_read, DynamicCoroutinesPool::Config);
+    // batchRead handlers are IO-bound (the coroutine mostly awaits disk reads
+    // and RDMA completions): raise the default concurrency to match the
+    // downstream limits (max_concurrent_rdma_writes=256, 1024 pooled buffers),
+    // otherwise the pool is the narrowest gate on read parallelism.
+    CONFIG_OBJ(coroutines_pool_read, DynamicCoroutinesPool::Config, [](DynamicCoroutinesPool::Config &c) {
+      c.set_coroutines_num(256);
+    });
     CONFIG_OBJ(coroutines_pool_update, DynamicCoroutinesPool::Config);
     CONFIG_OBJ(coroutines_pool_sync, DynamicCoroutinesPool::Config);
     CONFIG_OBJ(coroutines_pool_default, DynamicCoroutinesPool::Config);

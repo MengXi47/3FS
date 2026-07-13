@@ -71,6 +71,27 @@ BatchReadJob::BatchReadJob(std::span<const ReadIO> readIOs, std::span<IOResult> 
   }
 }
 
+namespace {
+
+// add one finished job to the transmission; nullopt = skipped (disk error) or
+// add failed, otherwise the number of bytes staged (may be zero).
+std::optional<size_t> addOneJobToBatch(AioReadJob &job, serde::CallContext::RDMATransmission &batch) {
+  if (!job.result().lengthInfo) {
+    return std::nullopt;
+  }
+  auto length = *job.result().lengthInfo;
+  auto localbuf = job.state().localbuf.subrange(job.state().headLength, length);
+  auto result = batch.add(job.readIO().rdmabuf, localbuf);
+  if (UNLIKELY(!result)) {
+    rdmaWriteFails.addSample(1);
+    job.result().lengthInfo = makeError(std::move(result.error()));
+    return std::nullopt;
+  }
+  return length;
+}
+
+}  // namespace
+
 size_t BatchReadJob::addBufferToBatch(serde::CallContext::RDMATransmission &batch) {
   return addRangeToBatch(batch, 0, jobs_.size());
 }
@@ -80,18 +101,9 @@ size_t BatchReadJob::addRangeToBatch(serde::CallContext::RDMATransmission &batch
   size_t writeCount = 0;
   size_t writeBytes = 0;
   for (auto i = begin; i < end; ++i) {
-    auto &job = jobs_[i];
-    if (job.result().lengthInfo) {
-      auto length = *job.result().lengthInfo;
-      auto localbuf = job.state().localbuf.subrange(job.state().headLength, length);
-      auto result = batch.add(job.readIO().rdmabuf, localbuf);
-      if (UNLIKELY(!result)) {
-        rdmaWriteFails.addSample(1);
-        job.result().lengthInfo = makeError(std::move(result.error()));
-      } else {
-        ++writeCount;
-        writeBytes += length;
-      }
+    if (auto added = addOneJobToBatch(jobs_[i], batch)) {
+      ++writeCount;
+      writeBytes += *added;
     }
   }
   rdmaWriteCount.addSample(writeCount);
@@ -107,9 +119,11 @@ void BatchReadJob::initCompletionQueue() {
 CoTask<AioReadJob *> BatchReadJob::takeReady() {
   co_await readySem_.co_wait();
   AioReadJob *job = nullptr;
-  auto succ = readyQueue_.read(job);
-  assert(succ);
-  (void)succ;
+  // readIfNotEmpty, not read(): with multiple producers the semaphore may be
+  // signaled by a later ticket while an earlier ticket's write is still in
+  // progress; read() would spuriously fail, readIfNotEmpty waits for it.
+  auto succ = readyQueue_.readIfNotEmpty(job);
+  XLOGF_IF(FATAL, !succ, "ready queue empty after semaphore wait");
   co_return job;
 }
 
@@ -117,9 +131,8 @@ bool BatchReadJob::tryTakeReady(AioReadJob *&job) {
   if (!readySem_.try_wait()) {
     return false;
   }
-  auto succ = readyQueue_.read(job);
-  assert(succ);
-  (void)succ;
+  auto succ = readyQueue_.readIfNotEmpty(job);
+  XLOGF_IF(FATAL, !succ, "ready queue empty after semaphore try_wait");
   return true;
 }
 
@@ -128,18 +141,9 @@ size_t BatchReadJob::addJobsToBatch(std::span<AioReadJob *const> jobs, serde::Ca
   size_t writeCount = 0;
   size_t writeBytes = 0;
   for (auto *jobPtr : jobs) {
-    auto &job = *jobPtr;
-    if (job.result().lengthInfo) {
-      auto length = *job.result().lengthInfo;
-      auto localbuf = job.state().localbuf.subrange(job.state().headLength, length);
-      auto result = batch.add(job.readIO().rdmabuf, localbuf);
-      if (UNLIKELY(!result)) {
-        rdmaWriteFails.addSample(1);
-        job.result().lengthInfo = makeError(std::move(result.error()));
-      } else {
-        ++writeCount;
-        writeBytes += length;
-      }
+    if (auto added = addOneJobToBatch(*jobPtr, batch)) {
+      ++writeCount;
+      writeBytes += *added;
     }
   }
   rdmaWriteCount.addSample(writeCount);
@@ -183,7 +187,8 @@ void BatchReadJob::finish(AioReadJob *job) {
   if (completionDriven_) {
     // job result is fully written before this point; the queue write/read pair
     // and the semaphore provide the release/acquire edge to the sender.
-    readyQueue_.write(job);
+    auto written = readyQueue_.write(job);
+    XLOGF_IF(FATAL, !written, "ready queue full: a job finished more than once?");
     readySem_.signal();
   }
   if (++finishedCount_ == jobs_.size()) {

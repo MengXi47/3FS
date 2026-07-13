@@ -161,19 +161,20 @@ void BufferPool::clear(CPUExecutorGroup &executor) {
 }
 
 BufferIndex BufferPool::allocate() {
-  // the caller holds a semaphore token, so the queue cannot be empty.
+  // the caller holds a semaphore token, so the queue is logically non-empty.
+  // readIfNotEmpty, not read(): a concurrent deallocate may have signaled the
+  // semaphore while an earlier ticket's write is still in progress — read()
+  // would spuriously fail, readIfNotEmpty waits for the in-progress write.
   BufferIndex index;
-  auto succ = freeIndex_.read(index);
-  assert(succ);
-  (void)succ;
+  auto succ = freeIndex_.readIfNotEmpty(index);
+  XLOGF_IF(FATAL, !succ, "buffer pool free list empty after semaphore wait");
   return index;
 }
 
 BufferIndex BufferPool::allocateBig() {
   BufferIndex index;
-  auto succ = bigFreeIndex_.read(index);
-  assert(succ);
-  (void)succ;
+  auto succ = bigFreeIndex_.readIfNotEmpty(index);
+  XLOGF_IF(FATAL, !succ, "big buffer pool free list empty after semaphore wait");
   return index;
 }
 
@@ -181,10 +182,12 @@ void BufferPool::deallocate(const BufferIndex &index) {
   // write before signal so a successful semaphore wait implies a readable entry;
   // capacity equals the total index count, so the write cannot fail.
   if (UNLIKELY(index.registerIndex >= bigBufferRegisterIndexStart_)) {
-    bigFreeIndex_.write(index);
+    auto written = bigFreeIndex_.write(index);
+    XLOGF_IF(FATAL, !written, "big buffer free list full: double deallocate?");
     bigSemaphore_.signal();
   } else {
-    freeIndex_.write(index);
+    auto written = freeIndex_.write(index);
+    XLOGF_IF(FATAL, !written, "buffer free list full: double deallocate?");
     semaphore_.signal();
   }
 }

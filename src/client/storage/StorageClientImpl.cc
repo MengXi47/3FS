@@ -1710,10 +1710,12 @@ CoTryTask<void> StorageClientImpl::batchReadWithoutRetry(ClientRequestContext &r
         co_return false;
       }
 
-      auto inlinebuf = &response->inlinebuf.data[0];
-      for (auto readIO : batchIOs) {
-        std::memcpy(readIO->data, inlinebuf, readIO->resultLen());
-        inlinebuf += readIO->resultLen();
+      if (totalDataLen > 0) {  // all-IOs-failed batches carry an empty buffer
+        auto inlinebuf = response->inlinebuf.data.data();
+        for (auto readIO : batchIOs) {
+          std::memcpy(readIO->data, inlinebuf, readIO->resultLen());
+          inlinebuf += readIO->resultLen();
+        }
       }
     }
 

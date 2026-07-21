@@ -167,6 +167,66 @@ ChainInfo    = chains[11] → targets = [T_a(HEAD), T_b, T_c(TAIL)]
 
 同檔案的 chunk 0,1,2,3 會分別落在 stripe 0,1,2,3（4 條不同 chain，多半在不同 node），chunk 4 又回到 stripe 0 —— 這就是條帶化平行。
 
+### 1.7 單一檔案存入後的分配總表（沿用 Design Notes 拓樸）
+
+Design Notes（`docs/design_notes.md:107-120`）用一張 chain table 表格描述「叢集長什麼樣」，但止步於此——沒有展示「一個檔案存進來之後，每一塊到底落在哪」。本節沿用同一套拓樸把後半段補完。
+
+**叢集前提**（與 design_notes 第一張表完全相同）：6 個 node `A`–`F`、每 node 1 顆 SSD、每顆 SSD 建 5 個 target（共 30 個：`A1`…`F5`）、3 副本 → 10 條 chain 組成 chain table #1（版本 1）：Chain 1=`A1,B1,C1`、Chain 2=`D1,E1,F1`、…、Chain 10=`D5,E5,F5`（奇數鏈在 A/B/C，偶數鏈在 D/E/F）。
+
+**檔案前提**：新建 `/data/model.ckpt`，inode `0x1234`，寫入 3 MiB；父目錄 layout 為 `chunkSize=512KiB`、`stripeSize=4`、`tableId=1`。
+
+#### 建檔那一刻：meta 只寫下幾個 layout 欄位，不寫任何對照表
+
+`ChainAllocator::allocateChainsForLayout`（`meta/components/ChainAllocator.h:49-65,113-120`）在 create 時執行一次，決定並持久化到 inode 的只有：
+
+| inode 內的 layout 欄位 | 本例值 | 怎麼決定的 |
+|---|---|---|
+| `tableId` / `tableVersion` | 1 / 1 | 繼承父目錄；version 落檔為建檔當下的最新版 |
+| `chunkSize` | 512 KiB | 繼承父目錄（必為 2 的冪） |
+| `stripeSize` | 4 | 繼承父目錄 |
+| `ChainRange.baseIndex` | **5**（假設輪到） | per-`(tableId, stripeSize)` 的 round-robin 計數器：`base = (counter % 10) + 1`，之後 `counter += 4`。初值隨機（`rand32(10)/4*4`），所以序列如 `1→5→9→3→7→1…` 五個起點輪轉，相鄰建立的檔案起點錯開。計數器是 meta server 行程內的（多台 meta 各自輪轉，靠隨機初值錯開） |
+| `ChainRange.seed`（+ `STD_SHUFFLE_MT19937`） | 隨機 u64 | `find_safe_seed(4)`（`common/utils/Shuffle.h:174-201`）。“safe” 不是避免恆等排列，而是驗證該 seed 在 std / gcc10 / gcc11 三種 shuffle 實作下產生**相同排列**——seed 永久存在 inode，不同編譯器建出的 binary 必須重現同一映射 |
+
+**注意沒有的東西**：inode 不存任何「chunk → chain/target」對照。下面整張總表是 client 開檔拿到 layout 後，用這幾個欄位＋mgmtd 的 RoutingInfo **本地現算**出來的（design_notes.md:59 “client can independently compute”）。
+
+#### 開檔展開 chainIndexList
+
+`Layout::ChainRange::getChainIndexList(4)`（`Schema.cc:160-181`）：先生成 `[5,6,7,8]`，再用 seed 洗牌——**假設**洗出 `[7,5,8,6]`（真實排列由 seed 決定，但對這個檔案從此恆定不變）。
+
+#### 總表：3 MiB 檔案的 6 個 chunk 各落在哪
+
+左 4 欄是本檔案的推導（client 計算），右 5 欄就是 Design Notes 的 chain table 格式（mgmtd RoutingInfo 提供）：
+
+| Chunk | 檔案內偏移 | stripe | chainIndex | Chain | Version | Target 1 (head) | Target 2 | Target 3 (tail) |
+|:---:|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 0 | `[0, 512KiB)` | 0 | 7 | **7** | 1 | `A4` | `B4` | `C4` |
+| 1 | `[512KiB, 1MiB)` | 1 | 5 | **5** | 1 | `A3` | `B3` | `C3` |
+| 2 | `[1MiB, 1.5MiB)` | 2 | 8 | **8** | 1 | `D4` | `E4` | `F4` |
+| 3 | `[1.5MiB, 2MiB)` | 3 | 6 | **6** | 1 | `D3` | `E3` | `F3` |
+| 4 | `[2MiB, 2.5MiB)` | 0 | 7 | **7** | 1 | `A4` | `B4` | `C4` |
+| 5 | `[2.5MiB, 3MiB)` | 1 | 5 | **5** | 1 | `A3` | `B3` | `C3` |
+
+**逐欄說明**：
+
+| 欄 | 公式 / 來源 | 說明 |
+|---|---|---|
+| Chunk | `offset / 512KiB` | 垂直切塊（§1.1 第 3 層）。在 target 上的鍵是 `ChunkId = [00│00│0000000000001234│0000│chunk#]`（16B 大端），如 chunk 2 尾 4B 為 `00000002` |
+| stripe | `Chunk % 4` | 水平條帶槽位（第 5 層，`Schema.cc:195`）；超過 stripeSize 的 chunk 環繞回來 |
+| chainIndex | `shuffled[stripe]` = `[7,5,8,6][stripe]` | 洗牌後查表（第 6 層）。這一步之後映射與 offset 無關、永不再變 |
+| Chain | `table#1.chains[(chainIndex−1) % 10]` | 1-based＋取模（第 8 層，`RoutingInfo.cc:22`）。本例 index ≤ 10 未觸發環繞；若 round-robin 輪到 `baseIndex=9`，列表 `[9,10,11,12]` 就解析成 Chain `9,10,1,2`——環繞正是為此存在 |
+| Version | chain 版本 | 寫入請求攜帶，與 target 端最新 chainVer 不符即拒收（§3.4）；target 掉線/歸隊重排時 +1（§4.2-4.3） |
+| Target 1 (head) | `ChainInfo.targets[0]` | **所有寫入的唯一入口**：對 chunk 0 的寫只會發給 `A4`，再由 A4→B4→C4 逐跳傳遞（§3.3） |
+| Target 2 / 3 | `targets[1..]` | 中繼 / TAIL。**讀取可打到三者任一** serving 副本（apportioned queries，§3.6）；TAIL 是強一致讀點 |
+
+**從表格能讀出的行為**：
+
+1. **單檔平行度 = stripeSize**：6 個 chunk 的寫入分頭進 4 條 chain（4 個 HEAD），讀取分散到 4×3 = 12 個 target（六台 node 全部參與）。chunk 4 之後回到 chunk 0 的鏈——檔案再大也只碰這 4 條 chain。生產環境把 stripe 開到 200（design_notes.md:97）就是為了讓單一大檔吃滿整叢集頻寬。
+2. **shuffle 的用意**：round-robin 已讓不同檔案的 baseIndex 錯開；洗牌進一步讓「chunk 0」（最常被讀的檔頭）不總是落在 baseIndex 那條鏈，避免結構性熱點（design_notes.md:57）。
+3. **一顆 SSD 以多個身分服務多條鏈**：node A 的同一顆盤在本表中同時是 `A3`（Chain 5 HEAD）與 `A4`（Chain 7 HEAD）——「每 SSD 多 target」的用意：A 故障時其流量由多條鏈的不同夥伴分攤（design_notes 第二張表與 `deploy/data_placement` 求解器把配對進一步打散）。
+4. **玩具表格的侷限**：此規整排列下 4 個 HEAD 恰好集中在 A、D 兩台。寫入資料流本就逐跳流經全部副本（§3.3），但「入口」集中仍非理想；真實 chain table 由整數規劃產生，不會這麼規整。
+5. **這張總表不存在於任何地方**：左半（chunk→chain）由 inode 的 layout 欄位決定、自建檔起恆定；右半（chain→target）是 mgmtd RoutingInfo 的當下快照——target 故障時右半會變（順序重排、版本 +1，§4），左半永不變。這正是「layout 存相對 chainIndex 而非全域 ChainId」的解耦效果（§1.4）。
+6. **尾端不滿的 chunk 不佔滿 chunkSize**：若檔案是 3 MiB + 1B，chunk 6 只含 1 B；chunk engine 按實際大小選 size class（§2.3），512KiB 只是切片座標的模數、不是實體配額。小於 512KiB 的檔案整檔只佔 1 條 chain 的 1 個 chunk——這也是 meta「長度 hint 從 16 起倍增」優化的背景（design_notes.md:97）。
+
 ---
 
 ## 2. 實體層級：Node → Target → Disk → Chunk Engine
@@ -598,6 +658,7 @@ UpdateType         : WRITE / REMOVE / TRUNCATE / EXTEND / COMMIT                
 | 主題 | 檔案 |
 |------|------|
 | 檔案切片（chunk/chain 計算） | `fbs/meta/Schema.cc`（`getChunkId`/`getChainOfChunk`）、`fuse/PioV.cc` |
+| 建檔配鏈（round-robin + shuffle seed） | `meta/components/ChainAllocator.h`、`common/utils/Shuffle.h`（`find_safe_seed`） |
 | ChunkId / Layout / File | `fbs/meta/Schema.h` |
 | Chain/Target/Node 型別 | `fbs/mgmtd/{ChainRef,ChainInfo,ChainTargetInfo,TargetInfo,ChainTable,RoutingInfo,MgmtdTypes,NodeInfo}.h` |
 | RoutingInfo 解析 | `fbs/mgmtd/RoutingInfo.cc`（`getChainId`） |
@@ -614,7 +675,7 @@ UpdateType         : WRITE / REMOVE / TRUNCATE / EXTEND / COMMIT                
 
 ## 一頁總結
 
-1. **資料分佈是 12 層映射**：`inode+offset → chunkIndex → ChunkId(16B) → stripe → chainIndex → ChainRef → ChainId → ChainInfo → Target → Node → Disk → chunk engine position`。`chunkSize`(2 的冪)決定垂直切塊、`stripeSize`決定水平條帶化（跨 node 平行）、chainIndex 經 chain table 1-based 取模環繞解析成全域 ChainId。
+1. **資料分佈是 12 層映射**：`inode+offset → chunkIndex → ChunkId(16B) → stripe → chainIndex → ChainRef → ChainId → ChainInfo → Target → Node → Disk → chunk engine position`。`chunkSize`(2 的冪)決定垂直切塊、`stripeSize`決定水平條帶化（跨 node 平行）、chainIndex 經 chain table 1-based 取模環繞解析成全域 ChainId。建檔配鏈 = meta 端 per-(table,stripe) round-robin 選 baseIndex + seed 洗牌；單一檔案的完整分配總表見 §1.7。
 2. **Chunk 實體儲存**：11 種 64KiB–64MiB 固定大小級別，每級 256 cluster 檔，檔內切 group(256 槽)，Position 是打包 u64；用 `fallocate`/punch-hole 管理空間；metadata 存 RocksDB(7 種前綴 key)；COW 配合 CRAQ pending/commit，舊版本靠 refcount 保留。
 3. **CRAQ**：寫入 HEAD→TAIL（逐跳 RDMA Read 拉資料），commit TAIL→HEAD 回溯（靠 forward 阻塞語意）；三版本(commitVer/updateVer/chainVer)+ChunkState(COMMIT/DIRTY/CLEAN)實現 pending/committed；讀分散到任一 serving 副本(LoadBalance)、寫到 HEAD；雙層鎖+per-disk 串行保證一致。
 4. **Target 狀態機**：storage 報 localState(事實)，mgmtd 算 publicState(決策)，`generateNewChain` 是純函式狀態機；恢復路徑 `OFFLINE→WAITING→SYNCING→SERVING` 漸進、一鏈一次一個 SYNCING；HEAD 失效先變 LASTSRV(資料最全保護位)。

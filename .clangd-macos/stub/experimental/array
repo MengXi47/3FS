@@ -1,0 +1,32 @@
+// libstdc++ 還留著 <experimental/array>（Library Fundamentals TS v2），
+// libc++ 已經移除。tests/meta/MetaTestBase.h 用它的 make_array。
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+
+namespace std {
+namespace experimental {
+inline namespace fundamentals_v2 {
+
+template <typename D = void, typename... Types>
+constexpr auto make_array(Types &&...t)
+    -> array<conditional_t<is_void_v<D>, common_type_t<Types...>, D>, sizeof...(Types)> {
+  return {{static_cast<conditional_t<is_void_v<D>, common_type_t<Types...>, D>>(std::forward<Types>(t))...}};
+}
+
+template <typename T, size_t N, size_t... I>
+constexpr array<remove_cv_t<T>, N> __to_array(T (&a)[N], index_sequence<I...>) {
+  return {{a[I]...}};
+}
+
+template <typename T, size_t N>
+constexpr array<remove_cv_t<T>, N> to_array(T (&a)[N]) {
+  return __to_array(a, make_index_sequence<N>{});
+}
+
+}  // namespace fundamentals_v2
+}  // namespace experimental
+}  // namespace std

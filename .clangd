@@ -1,3 +1,2 @@
 CompileFlags:
-  Add: -fcoroutines-ts
-  Remove: [-fcoroutines, -DNO_INTELLISENSE]
+  Remove: [-fcoroutines, -fcoroutines-ts, -DNO_INTELLISENSE, -m*]

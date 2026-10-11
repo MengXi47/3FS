@@ -64,7 +64,7 @@ CMake 之外的獨立交付物，初次盤點時遺漏，第三輪補上。
 | 產出物 | 原始碼 | 報告 |
 |---|---|---|
 | `trash_cleaner` | `src/client/trash_cleaner/` | ✅ [報告](trash_cleaner-Rust垃圾回收工具深度剖析.md) |
-| `chunk_engine` | `src/storage/chunk_engine/` | ✅ [報告](chunk_engine-Rust本地儲存引擎深度剖析.md) |
+| `chunk_engine` | `src/storage/chunk_engine/` | ✅ [報告](chunk_engine-Rust本地儲存引擎深度剖析.md)、[架構圖解](chunk_engine-架構圖解.md) |
 | `hf3fs-usrbio-sys` | `src/lib/rs/hf3fs-usrbio-sys/` | 併入 USRBIO 報告 |
 
 ---

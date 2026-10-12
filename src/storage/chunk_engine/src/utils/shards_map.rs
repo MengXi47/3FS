@@ -1,3 +1,24 @@
+//! 把一個大 `HashMap` 拆成 `S` 個小 `HashMap` 的分片容器。
+//!
+//! **不是並發容器**：所有修改都要 `&mut self`，本身沒有任何鎖。在 crate 內它被放在
+//! `ChunkAllocator` 裡 (`active_groups`、`frozen_groups`、`position_rc`)，由
+//! `alloc/allocator.rs` 的 `Mutex<ChunkAllocator>` 統一保護。
+//!
+//! 分片的效果是每個分片各自擴容：單次 insert 觸發 rehash 時，只會搬動約 1/S 的元素，
+//! 在持有 allocator 鎖的臨界區內不會出現整張大表一起 rehash 的長停頓
+//! (`position_rc` 以 `1 << 20` 的容量建立，規模可觀)。
+//!
+//! ```text
+//!   key --DefaultHasher--> h --(h % S)--> shards[i]: HashMap<K, V>
+//!
+//!   +----------+----------+-----+------------+
+//!   | shard 0  | shard 1  | ... | shard S-1  |    S = 64 by default
+//!   | HashMap  | HashMap  |     | HashMap    |
+//!   +----------+----------+-----+------------+
+//!
+//!   iter(): shard 0 entries -> shard 1 entries -> ... (hash order, not sorted)
+//! ```
+
 use std::borrow::Borrow;
 use std::collections::{
     hash_map::{DefaultHasher, Entry},
@@ -5,10 +26,12 @@ use std::collections::{
 };
 use std::hash::{Hash, Hasher};
 
+/// `S` 個 `HashMap` 組成的分片 map，`S` 預設 64。
 pub struct ShardsMap<K, V, const S: usize = 64> {
     shards: [HashMap<K, V>; S],
 }
 
+/// 依序走過每個分片的迭代器；`inner_it` 是目前分片，`array_it` 是尚未走到的分片。
 pub struct ShardsMapIter<'a, K, V> {
     array_it: std::slice::Iter<'a, HashMap<K, V>>,
     inner_it: std::collections::hash_map::Iter<'a, K, V>,
@@ -24,6 +47,7 @@ where
         }
     }
 
+    /// 總容量平均分給各分片，每片取 `capacity / S` 向上到 2 的冪。
     pub fn with_capacity(capacity: usize) -> Self {
         let cap = (capacity / S).next_power_of_two();
         Self {
@@ -31,6 +55,8 @@ where
         }
     }
 
+    /// 選分片。`DefaultHasher::new()` 用固定種子，同一個 key 永遠落在同一片；
+    /// 分片內的 `HashMap` 另外用自己的隨機種子再雜湊一次。
     fn shard<Q>(key: &Q) -> usize
     where
         K: Borrow<Q>,
@@ -65,6 +91,8 @@ where
         self.shards.iter().map(|m| m.len()).sum()
     }
 
+    /// 依分片順序迭代，順序由雜湊決定。allocator 常用 `iter().next()` 取「任意一個」元素；
+    /// 前面的分片都空時要逐片跳過，最差掃 S 個分片。
     pub fn iter(&self) -> ShardsMapIter<'_, K, V> {
         ShardsMapIter {
             array_it: self.shards[1..].iter(),
@@ -102,6 +130,7 @@ impl<'a, K, V> Iterator for ShardsMapIter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        // 目前分片走完就換下一片，直到所有分片都走完
         loop {
             if let Some(value) = self.inner_it.next() {
                 return Some(value);
@@ -118,6 +147,7 @@ impl<'a, K, V> Iterator for ShardsMapIter<'a, K, V> {
 mod tests {
     use super::*;
 
+    // 驗證 insert / get / iter / entry / remove 在 4 個分片下的行為與一般 HashMap 一致
     #[test]
     fn test_shards_map() {
         let mut map = ShardsMap::<usize, usize, 4>::with_capacity(1024);

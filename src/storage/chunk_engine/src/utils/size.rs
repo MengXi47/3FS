@@ -1,8 +1,26 @@
+//! 以 byte 為單位的大小型別，crate 內所有容量、offset、chunk_size 都用它表示。
+//!
+//! - 單位一律是 2 的冪 (KiB = 1024)；常數名雖叫 `KB` / `MB`，實際是 KiB / MiB。
+//! - `#[repr(C)]` 包一個 u64，記憶體佈局與 u64 相同，所以內含 `Size` 的 `UsedSize` 可以在
+//!   `cxx.rs` 直接 transmute 成 `ffi::RawUsedSize` (全 u64 欄位)。
+//! - 算術運算 (`+ - * / %`) 都是裸運算，不做溢位檢查；與 i32 / i64 互轉用 `as`，負數會繞回。
+//!
+//! 兩種文字格式：
+//!
+//! ```text
+//!   Display ({})   exact, largest unit that divides evenly   524288  -> "512KiB"
+//!                                                            1536    -> "1536B"
+//!   Debug   ({:?}) approximate via around(), 2 decimals       524288  -> "0.50MiB"
+//!                  (switches unit once value >= half of it)   1536    -> "1.50KiB"
+//! ```
+
+/// byte 數的 newtype；`repr(C)` 保證與 u64 同佈局 (FFI transmute 依賴這點)。
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
 #[repr(C)]
 pub struct Size(pub u64);
 
 impl Size {
+    // 以下常數都是 2 的冪單位：KB = 1024 B、MB = 1024 KB ...
     pub const B: Size = Size::byte(1);
     pub const KB: Size = Size::kibibyte(1);
     pub const MB: Size = Size::mebibyte(1);
@@ -37,6 +55,8 @@ impl Size {
         Size::new(value << 40)
     }
 
+    /// 近似表示 (Debug 用)：值達到某單位的一半就改用該單位，保留兩位小數，
+    /// 例如 512B 顯示為 "0.50KiB"。
     pub fn around(&self) -> String {
         if self.0 == 0 {
             "0B".to_string()
@@ -66,6 +86,9 @@ impl Size {
     }
 }
 
+// 替每個整數型別 $t 一次實作：與 Size 互轉 (From)、比較 (PartialEq)、
+// 雙向的 Add / Mul / Rem 與 AddAssign / MulAssign，讓 `Size * 256`、`64 * Size::KB`、
+// `size == 0` 這類寫法成立。轉換一律用 `as`，不檢查範圍。
 macro_rules! impl_trait_for_size {
     ($($t:ty),*) => {
         $(impl From<$t> for Size {
@@ -203,6 +226,9 @@ impl std::ops::Rem<Self> for Size {
     }
 }
 
+/// 精確表示：取能整除的最大單位，否則退回 byte。`Clusters` 的子目錄名
+/// (`64KiB/`、`512KiB/`... 見 `alloc/allocators.rs` 的 `create`) 就是用它產生的，
+/// 改輸出格式會讓既有資料目錄對不上。
 impl std::fmt::Display for Size {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.0 == 0 {
@@ -221,6 +247,7 @@ impl std::fmt::Display for Size {
     }
 }
 
+/// 近似表示，委派給 `around()`；tracing log 用 `{:?}` 印 Size 時看到的是這個格式。
 impl std::fmt::Debug for Size {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.around())
@@ -229,6 +256,7 @@ impl std::fmt::Debug for Size {
 
 #[cfg(test)]
 mod tests {
+    // 驗證單位建構、Display / Debug 兩種格式，以及與整數的混合運算
     #[test]
     fn test_size() {
         use super::Size;

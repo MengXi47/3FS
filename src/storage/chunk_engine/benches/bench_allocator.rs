@@ -1,7 +1,26 @@
+//! criterion 微基準：量測 512KiB size class 的「配置一個 chunk 再立刻釋放」成本。
+//!
+//! 只測記憶體中的 bitset / 集合操作，不寫資料、不碰 RocksDB；group 事先用
+//! `do_allocate_task(1, 1)` fallocate 好一個放進預備池，所以迴圈內不會走同步 fallocate。
+//!
+//! ```text
+//!   allocate(true)  -> Chunk { pos }            rc = 1, bit set
+//!   drop(Chunk)     -> dereference(pos)         rc = 0 -> deallocate, bit cleared
+//!                      group becomes empty      -> back to allocated pool
+//!   (repeat 65536 times per iteration)
+//! ```
+//!
+//! 執行 (需 Linux)：
+//!
+//! ```text
+//!   cargo bench --bench bench_allocator
+//! ```
+
 use chunk_engine::*;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::sync::Arc;
 
+// 連續 n 次：配置一個 chunk 後立即 drop，觸發引用計數歸零與位置回收
 fn allocate(allocator: &Arc<Allocator>, n: usize) {
     for _ in 0..n {
         drop(allocator.allocate(true).unwrap());
@@ -9,6 +28,9 @@ fn allocate(allocator: &Arc<Allocator>, n: usize) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
+    // 1. 在暫存目錄建立 512KiB 的 256 個 cluster 檔與 RocksDB
+    // 2. 載入 Allocator，預先 fallocate 一個 group 放進預備池
+    // 3. 每輪 bench 配置 / 釋放 1 << 16 次
     let dir = tempfile::tempdir().unwrap();
 
     let cluster_config = ClustersConfig {

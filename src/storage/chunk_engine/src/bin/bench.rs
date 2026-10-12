@@ -1,3 +1,26 @@
+//! 寫入吞吐量壓測：多執行緒持續建立新 chunk，每秒印出吞吐量與空間使用。
+//!
+//! 每個執行緒寫 `count` 個全新的 512KiB chunk (offset 0、整塊寫滿)，chunk_id 為
+//! `(thread_index << 32) + n` 的 8-byte big-endian，所以各執行緒的 id 互不重疊。
+//! 這條路徑會走 `Engine::write` -> `update_chunk` (new chunk) -> `commit_chunk`，
+//! 同時用 `start_allocate_workers(2)` 在背景補 group。
+//!
+//! 執行 (需 Linux：用到 O_DIRECT / fallocate)：
+//!
+//! ```text
+//!   cargo run --release --bin bench -- bench.toml
+//!
+//!   # bench.toml (all fields required)
+//!   threads = 8
+//!   count   = 10000
+//!   level   = "info"          # info | debug | anything else = warn
+//!
+//!   [engine]
+//!   path       = "/data/bench_engine"
+//!   create     = true
+//!   prefix_len = 4
+//! ```
+
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -7,6 +30,7 @@ use anyhow::{Context, Result};
 use chunk_engine::*;
 use serde::Deserialize;
 
+/// TOML 設定檔內容；`engine` 直接對應 `EngineConfig` (path / create / prefix_len)。
 #[derive(Debug, Default, Deserialize)]
 struct Config {
     engine: EngineConfig,
@@ -16,6 +40,7 @@ struct Config {
 }
 
 fn main() -> Result<()> {
+    // 1. 讀第一個命令列參數作為設定檔路徑並解析 TOML
     let mut iter = std::env::args();
     iter.next();
     let config_path = iter
@@ -28,6 +53,7 @@ fn main() -> Result<()> {
     let config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config file {:?}", config_path))?;
 
+    // 2. 設定 log 等級並輸出到 stdout
     let level = match config.level.as_str() {
         "info" => tracing::Level::INFO,
         "debug" => tracing::Level::DEBUG,
@@ -36,12 +62,14 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_max_level(level).init();
     tracing::info!("config content: {:#?}", config);
 
+    // 3. 開啟引擎、啟動 2 個背景配置執行緒，稍等讓預備池先補一些 group
     let engine = chunk_engine::Engine::open(&config.engine).unwrap();
     engine.start_allocate_workers(2);
     std::thread::sleep(std::time::Duration::from_millis(100));
     let bytes = Arc::new(AtomicUsize::default());
     let running = Arc::new(AtomicUsize::default());
 
+    // 4. 每個執行緒準備一塊填滿 i 的 512KiB 對齊 buffer (checksum 只算一次)，連續寫新 chunk
     let threads = (0..config.threads)
         .map(|i| {
             let engine = engine.clone();
@@ -67,6 +95,7 @@ fn main() -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // 5. 主執行緒每秒取走累計 bytes 印出吞吐量，直到所有寫入執行緒結束
     while running.load(Ordering::Acquire) > 0 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let bytes = bytes.swap(0, Ordering::Acquire);
@@ -79,6 +108,7 @@ fn main() -> Result<()> {
         );
     }
 
+    // 6. 收尾：join 寫入執行緒、停止背景配置執行緒，再跳過 meta_cache 的解構直接結束
     for thread in threads {
         thread.join().unwrap();
     }

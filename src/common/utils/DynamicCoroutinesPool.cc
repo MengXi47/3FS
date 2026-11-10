@@ -58,7 +58,7 @@ Result<Void> DynamicCoroutinesPool::setCoroutinesNum(uint32_t num) {
   } else {
     // decrease coroutines num.
     for (; coroutinesNum_ > num; --coroutinesNum_) {
-      queue_.enqueue(nullptr);
+      queue_.enqueue(std::nullopt);
     }
   }
   return Void{};
@@ -69,7 +69,7 @@ CoTask<void> DynamicCoroutinesPool::run() {
 
   while (true) {
     auto task = co_await queue_.co_dequeue();
-    if (task == nullptr) {
+    if (!task.has_value()) {
       co_return;
     }
 

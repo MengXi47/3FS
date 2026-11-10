@@ -2,6 +2,7 @@
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/experimental/coro/Baton.h>
+#include <optional>
 
 #include "common/monitor/Recorder.h"
 #include "common/utils/BoundedQueue.h"
@@ -27,7 +28,7 @@ class DynamicCoroutinesPool {
 
   Result<Void> stopAndJoin();
 
-  void enqueue(CoTask<void> &&task) { queue_.enqueue(std::make_unique<CoTask<void>>(std::move(task))); }
+  void enqueue(CoTask<void> &&task) { queue_.enqueue(std::optional<CoTask<void>>(std::move(task))); }
 
  protected:
   Result<Void> setCoroutinesNum(uint32_t num);
@@ -38,7 +39,7 @@ class DynamicCoroutinesPool {
 
  private:
   const Config &config_;
-  BoundedQueue<std::unique_ptr<CoTask<void>>> queue_;
+  BoundedQueue<std::optional<CoTask<void>>> queue_;
   std::unique_ptr<ConfigCallbackGuard> guard_;
 
   std::mutex mutex_;
